@@ -56,8 +56,8 @@ Options (anywhere on the line; `--` ends options):
   -h, --help          show this help
 
 Examples:
-  herdr-start ENG-2922
-  herdr-start ENG-2922 -a team "start with the sign-in screen"
+  herdr-start ENG-123
+  herdr-start ENG-123 -a team "start with the sign-in screen"
   herdr-start "users get stuck in a redirect loop after login"
   herdr-start -b develop feat/price-chart
   herdr-start --names "users get stuck in a redirect loop"
@@ -408,7 +408,7 @@ prompt=$(sanitize "$prompt")
 title=$(sanitize "$title")
 label=$title
 
-# herdr agent names: lowercase start, [a-z0-9_-], 1-32 chars (ENG-2922 → eng-2922, feat/x → feat-x).
+# herdr agent names: lowercase start, [a-z0-9_-], 1-32 chars (ENG-123 → eng-123, feat/x → feat-x).
 name=$(printf '%s' "${id:-$branch}" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9_-' '-')
 [[ $name =~ ^[a-z] ]] || name=a-$name
 name=${name:0:32}

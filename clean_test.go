@@ -10,7 +10,7 @@ func TestClean(t *testing.T) {
 	if got, want := clean("a\nb\x1bc", true), "a\nbc"; got != want {
 		t.Fatalf("clean(_, true) = %q, want %q", got, want)
 	}
-	if got := clean("ENG-2922 · Match web…", false); got != "ENG-2922 · Match web…" {
+	if got := clean("ENG-123 · Fix the login loop…", false); got != "ENG-123 · Fix the login loop…" {
 		t.Fatalf("clean dropped printable runes: %q", got)
 	}
 }

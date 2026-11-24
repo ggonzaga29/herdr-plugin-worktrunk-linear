@@ -2,14 +2,18 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
+	"time"
+	"unicode/utf8"
 )
 
 // Issue is one Linear issue in the menu.
@@ -47,11 +51,26 @@ type Agent struct {
 
 // run executes a command in dir and returns stdout; on failure the error carries stderr's first line.
 func run(dir, name string, args ...string) (string, error) {
-	cmd := exec.Command(name, args...)
+	return runFor(0, dir, name, args...)
+}
+
+// runFor is run with a time limit (0 = none), so a hung network call cannot block the menu.
+func runFor(limit time.Duration, dir, name string, args ...string) (string, error) {
+	ctx := context.Background()
+	if limit > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, limit)
+		defer cancel()
+	}
+	cmd := exec.CommandContext(ctx, name, args...)
+	cmd.WaitDelay = 2 * time.Second // children holding the pipes open must not outlive the limit
 	cmd.Dir = dir
 	var out, errb bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &out, &errb
 	if err := cmd.Run(); err != nil {
+		if ctx.Err() == context.DeadlineExceeded {
+			return out.String(), fmt.Errorf("%s took longer than %s", filepath.Base(name), limit)
+		}
 		msg := firstLine(stripANSI(errb.String()))
 		if msg == "" {
 			msg = err.Error()
@@ -62,6 +81,23 @@ func run(dir, name string, args ...string) (string, error) {
 }
 
 var ansiRE = regexp.MustCompile(`\x1b\[[0-9;?]*[A-Za-z]`)
+
+// clean makes text written by other people (Linear titles, descriptions) safe to draw: it drops
+// every control character (C0 including ESC, DEL, C1), so no escape sequence reaches the terminal.
+// Tabs become spaces; newlines are kept only when keepNewlines is set.
+func clean(s string, keepNewlines bool) string {
+	return strings.Map(func(r rune) rune {
+		switch {
+		case r == '\n' && keepNewlines:
+			return r
+		case r == '\t' || r == '\n' || r == '\r':
+			return ' '
+		case r < 0x20 || r == 0x7f || (r >= 0x80 && r <= 0x9f) || r == utf8.RuneError:
+			return -1 // controls, and invalid bytes (a raw 0x9b is CSI to an 8-bit terminal)
+		}
+		return r
+	}, s)
+}
 
 func stripANSI(s string) string { return ansiRE.ReplaceAllString(s, "") }
 
@@ -126,7 +162,7 @@ func loadIssues(repo string) ([]Issue, error) {
 	if _, err := exec.LookPath("linear"); err != nil {
 		return nil, errors.New("linear CLI not installed")
 	}
-	out, err := run(repo, "linear", "issue", "query", "--json", "--assignee", "self",
+	out, err := runFor(30*time.Second, repo, "linear", "issue", "query", "--json", "--assignee", "self",
 		"--state", "started", "--state", "unstarted", "--limit", "100")
 	if err != nil {
 		return nil, err
@@ -150,9 +186,9 @@ func loadIssues(repo string) ([]Issue, error) {
 	}
 	issues := make([]Issue, 0, len(res.Nodes))
 	for _, n := range res.Nodes {
-		is := Issue{ID: n.Identifier, Title: n.Title, State: n.State.Name}
+		is := Issue{ID: clean(n.Identifier, false), Title: clean(n.Title, false), State: clean(n.State.Name, false)}
 		for _, l := range n.Labels.Nodes {
-			is.Labels = append(is.Labels, l.Name)
+			is.Labels = append(is.Labels, clean(l.Name, false))
 		}
 		issues = append(issues, is)
 	}
@@ -160,7 +196,7 @@ func loadIssues(repo string) ([]Issue, error) {
 }
 
 func loadDetail(repo, id string) IssueDetail {
-	out, err := run(repo, "linear", "issue", "view", id, "--json", "--no-comments", "--no-download")
+	out, err := runFor(30*time.Second, repo, "linear", "issue", "view", id, "--json", "--no-comments", "--no-download")
 	if err != nil {
 		return IssueDetail{Err: err.Error()}
 	}
@@ -171,14 +207,15 @@ func loadDetail(repo, id string) IssueDetail {
 	if json.Unmarshal([]byte(out), &res) != nil {
 		return IssueDetail{Err: "could not read linear's output"}
 	}
-	return IssueDetail{Branch: res.BranchName, Description: res.Description}
+	return IssueDetail{Branch: clean(res.BranchName, false), Description: clean(res.Description, true)}
 }
 
 // resolveNames asks the engine how it would name this input, without creating anything.
 func resolveNames(repo, input string, agent Agent) (Names, error) {
 	args := append([]string{"--names"}, agent.Args...)
 	args = append(args, "--", input)
-	out, err := run(repo, engine("herdr-start"), args...)
+	// Claude is capped at 15 s inside; this also covers a hung Linear lookup for tickets.
+	out, err := runFor(45*time.Second, repo, engine("herdr-start"), args...)
 	if err != nil {
 		return Names{}, errors.New(strings.TrimPrefix(err.Error(), "herdr-start: "))
 	}
@@ -186,6 +223,8 @@ func resolveNames(repo, input string, agent Agent) (Names, error) {
 	if err := json.Unmarshal([]byte(out), &n); err != nil {
 		return Names{}, errors.New("could not read herdr-start's answer")
 	}
+	// herdr-start already strips these; belt and braces, since they are drawn and passed back.
+	n.Title, n.Prompt, n.Branch = clean(n.Title, false), clean(n.Prompt, false), clean(n.Branch, false)
 	return n, nil
 }
 

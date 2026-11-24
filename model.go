@@ -89,11 +89,13 @@ type model struct {
 	projects []string
 	prefs    prefs
 
-	form  form
-	edit  textinput.Model
-	pick  pick
-	spin  spinner.Model
-	flash string
+	form     form
+	nameGen  int // bumped for every naming request, across forms, so stale answers never match
+	edit     textinput.Model
+	editOrig string // the field's value when its edit began
+	pick     pick
+	spin     spinner.Model
+	flash    string
 
 	action *Action
 }
@@ -338,7 +340,8 @@ func (m *model) startNaming() tea.Cmd {
 	if m.form.project == "" || len(m.agents) == 0 {
 		return nil
 	}
-	m.form.gen++
+	m.nameGen++
+	m.form.gen = m.nameGen
 	m.form.naming = true
 	m.form.nameErr = ""
 	gen, dir, input, agent := m.form.gen, m.form.project, m.form.input, m.agents[m.form.agent]
@@ -359,14 +362,28 @@ func (m model) gotNames(msg namesMsg) model {
 		return m
 	}
 	f.names = msg.names
-	if !f.edited[fTitle] {
-		f.title = msg.names.Title
-	}
-	if !f.edited[fBranch] {
-		f.branch = msg.names.Branch
-	}
-	if !f.edited[fPrompt] {
-		f.prompt = msg.names.Prompt
+	fresh := map[int]string{fTitle: msg.names.Title, fBranch: msg.names.Branch, fPrompt: msg.names.Prompt}
+	for field, v := range fresh {
+		if f.edited[field] {
+			continue
+		}
+		// The field being edited: follow the answer only if nothing was typed yet.
+		if f.editing && f.cursor == field && m.edit.Value() != m.editOrig {
+			continue
+		}
+		switch field {
+		case fTitle:
+			f.title = v
+		case fBranch:
+			f.branch = v
+		case fPrompt:
+			f.prompt = v
+		}
+		if f.editing && f.cursor == field {
+			m.edit.SetValue(v)
+			m.edit.CursorEnd()
+			m.editOrig = v
+		}
 	}
 	return m
 }
@@ -376,6 +393,11 @@ func (m model) updateForm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if f.editing {
 		switch msg.String() {
 		case "enter":
+			if m.edit.Value() == m.editOrig { // nothing typed: keep the field as it is, still Claude's
+				f.editing = false
+				m.edit.Blur()
+				return m, nil
+			}
 			v := strings.TrimSpace(m.edit.Value())
 			switch f.cursor {
 			case fTitle:
@@ -418,6 +440,7 @@ func (m model) updateForm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			v := map[int]string{fTitle: f.title, fBranch: f.branch, fPrompt: f.prompt}[f.cursor]
 			m.edit.SetValue(v)
 			m.edit.CursorEnd()
+			m.editOrig = v
 			m.edit.Width = max(10, m.width/2-20)
 			f.editing = true
 			return m, m.edit.Focus()
@@ -493,6 +516,9 @@ func (m model) updatePick(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 func (m model) create() (tea.Model, tea.Cmd) {
 	f := m.form
 	switch {
+	case len(m.agents) == 0:
+		m.flash = "no agent CLI found on PATH (claude, codex, ...)"
+		return m, nil
 	case f.project == "":
 		m.flash = "pick a project first"
 		return m, nil
@@ -512,8 +538,12 @@ func (m model) create() (tea.Model, tea.Cmd) {
 	if f.base != "" {
 		args = append(args, "-b", f.base)
 	}
-	if f.issueID != "" {
-		args = append(args, "--", f.issueID)
+	ticket := f.issueID
+	if ticket == "" && f.names.Kind == "ticket" {
+		ticket = f.names.ID // typed ENG-123 or a linear.app link into the New row
+	}
+	if ticket != "" {
+		args = append(args, "--", ticket)
 	}
 	m.prefs[f.project] = agent.Label // saved by main, and only on a real run
 	m.action = &Action{Kind: "create", Dir: f.project, Args: args}

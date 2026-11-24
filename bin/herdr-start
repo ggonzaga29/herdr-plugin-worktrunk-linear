@@ -160,15 +160,33 @@ slugify() {  # text → lowercase-hyphen slug, at most 50 chars
 
 clean_branch() {  # Claude's answer → a safe branch name, or nothing
   local b
-  b=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | tr ' ' '-' | sed -E 's#[^a-z0-9/._-]+#-#g; s#-+#-#g; s#^[-/.]+##; s#[-/.]+$##' | cut -c1-60 | sed -E 's#[-/.]+$##')
-  git check-ref-format --branch "$b" >/dev/null 2>&1 && printf '%s' "$b"
+  # Collapse what git refuses: //, .., a .lock ending, dots or dashes at either end of a part.
+  b=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | tr ' ' '-' |
+    sed -E 's#[^a-z0-9/._-]+#-#g; s#-+#-#g; s#/+#/#g; s#\.\.+#.#g; s#(^|/)[-.]+#\1#g; s#[-.]+(/|$)#\1#g; s#^/+##; s#/+$##' |
+    cut -c1-60 | sed -E 's#\.lock$##; s#[-/.]+$##')
+  # Always succeeds (set -e callers): prints the name only when git accepts it.
+  if git check-ref-format --branch "$b" >/dev/null 2>&1; then printf '%s' "$b"; fi
 }
 
 branch_exists() { git show-ref --verify --quiet "refs/heads/$1" || [[ -n $(git for-each-ref --count=1 "refs/remotes/*/$1") ]]; }
 
+# A new branch also clashes with branches nested under it (feat/login vs feat/login/v2) or above it (feat vs feat/x).
+branch_taken() {
+  local b=$1 p=''
+  branch_exists "$b" && return 0
+  [[ -n $(git for-each-ref --count=1 "refs/heads/$b/" "refs/remotes/*/$b/") ]] && return 0
+  while [[ $b == */* ]]; do
+    p=${p:+$p/}${b%%/*}
+    b=${b#*/}
+    branch_exists "$p" && return 0
+  done
+  return 1
+}
+
 dedupe() {  # a NEW name must not collide with an existing branch: name, name-2, name-3, ...
   local b=$1 n=2
-  while branch_exists "$b" && [[ $n -lt 10 ]]; do b="$1-$n"; n=$((n + 1)); done
+  while branch_taken "$b" && [[ $n -lt 10 ]]; do b="$1-$n"; n=$((n + 1)); done
+  branch_taken "$b" && die "no free branch name for $1 (tried up to -9); pass -B NAME"
   printf '%s' "$b"
 }
 
@@ -182,7 +200,7 @@ Branch: lowercase words joined by hyphens, at most 50 characters. Follow the nam
 Title: at most 40 characters, sentence case, no trailing period.
 Task: $1"
   if json=$(ask_claude "$schema" "$ask"); then
-    b=$(clean_branch "$(jq -r '.branch // ""' <<<"$json")")
+    b=$(clean_branch "$(jq -r '.branch // ""' <<<"$json")") || b=''
     t=$(jq -r '.title // ""' <<<"$json" | tr '\n' ' ' | sed 's/ *$//' | cut -c1-60)
   fi
   if [[ -n $b ]]; then
@@ -249,7 +267,7 @@ if [[ -n $candidate ]]; then
   strict=false
   [[ $candidate =~ ^[A-Z]+-[0-9]+$ || $input == *linear.app* ]] && strict=true
   if command -v linear >/dev/null &&
-     issue=$(linear issue view "$candidate" --json --no-comments 2>"$tmp") &&
+     issue=$(linear issue view "$candidate" --json --no-comments --no-download 2>"$tmp") &&
      id=$(jq -er '.identifier // empty' <<<"$issue" 2>/dev/null); then
     kindof=ticket
     ticket_title=$(jq -r '.title // ""' <<<"$issue")
@@ -297,8 +315,14 @@ case $kindof in
     prompt=$extra ;;
 esac
 $prompt_set && prompt=$prompt_opt
-# Newlines would submit a typed prompt early in most agent TUIs.
-prompt=${prompt//$'\n'/ }
+# Ticket titles are written by other people and land in the agent's input and herdr's sidebar:
+# a newline or carriage return would submit early, an escape sequence would drive the terminal.
+# Line breaks become spaces; every other control character (C0, DEL, and UTF-8 C1) is dropped.
+sanitize() {
+  printf '%s' "$1" | tr '\n\r\t' '   ' | LC_ALL=C tr -d '\000-\037\177' | LC_ALL=C sed $'s/\xc2[\x80-\x9f]//g'
+}
+prompt=$(sanitize "$prompt")
+title=$(sanitize "$title")
 label=$title
 
 # herdr agent names: lowercase start, [a-z0-9_-], 1-32 chars (ENG-2922 → eng-2922, feat/x → feat-x).
@@ -368,10 +392,12 @@ path=$(jq -r '.path // empty' <<<"$out" 2>/dev/null || true)
 # ---------- herdr workspace ----------
 # Register under the repo's root workspace (herdr rejects a linked worktree's own workspace, and an
 # outside-herdr shell has none); herdr reuses or creates that root workspace.
-opened=$("$herdr" worktree open --cwd "$repo_root" --path "$path" --label "$label" --focus 2>&1) ||
-  die "herdr could not open the worktree: $opened (worktree is at $path; rerun herdr-start to retry)"
-ws=$(jq -r .result.workspace.workspace_id <<<"$opened")
-pane=$(jq -r .result.root_pane.pane_id <<<"$opened")
+# stderr kept apart so a warning can never break the JSON; every field read is checked.
+opened=$("$herdr" worktree open --cwd "$repo_root" --path "$path" --label "$label" --focus 2>"$tmp") ||
+  die "herdr could not open the worktree: $(cat "$tmp") (worktree is at $path; rerun herdr-start to retry)"
+ws=$(jq -er .result.workspace.workspace_id <<<"$opened" 2>/dev/null) &&
+  pane=$(jq -er .result.root_pane.pane_id <<<"$opened" 2>/dev/null) ||
+  die "unexpected answer from herdr worktree open: $opened (worktree is at $path)"
 
 log=${XDG_CACHE_HOME:-$HOME/.cache}/herdr-start.log
 give_up() {
@@ -409,9 +435,10 @@ if [[ $(jq -r .result.already_open <<<"$opened") == true ]]; then
     exit 0
   fi
   # Open but agent-less: never type into a pane that may be running something; use a new split.
-  split=$("$herdr" pane split "$pane" --direction right --cwd "$path" --focus 2>&1) ||
-    die "could not split a pane for the agent: $split"
-  pane=$(jq -r .result.pane.pane_id <<<"$split")
+  split=$("$herdr" pane split "$pane" --direction right --cwd "$path" --focus 2>"$tmp") ||
+    die "could not split a pane for the agent: $(cat "$tmp")"
+  pane=$(jq -er .result.pane.pane_id <<<"$split" 2>/dev/null) ||
+    die "unexpected answer from herdr pane split: $split"
   note "$label was already open without an agent; starting one in a new split"
 fi
 
@@ -420,10 +447,11 @@ fi
 "$herdr" pane run "$pane" "$launcher" >/dev/null || give_up "could not run $launcher in pane $pane"
 
 finish() {  # wait for the agent, answer nothing for you, rename it, type the prompt
-  local tries=0 state
-  # `agent wait` errors at once until herdr has detected the agent, so retry for up to 60s.
-  until state=$("$herdr" agent wait "$pane" --until idle --until blocked --timeout 60000 2>/dev/null); do
-    (( ++tries < 60 )) || give_up "no agent detected in pane $pane after 60s; check the pane for errors"
+  local state deadline=$((SECONDS + 90))
+  # `agent wait` errors at once until herdr has detected the agent, and an agent that is detected
+  # but still busy (a slow startup hook) makes it time out: retry in short waits, one deadline.
+  until state=$("$herdr" agent wait "$pane" --until idle --until blocked --timeout 5000 2>/dev/null); do
+    [[ $SECONDS -lt $deadline ]] || give_up "agent in pane $pane was not ready after 90s; check the pane for errors"
     sleep 1
   done
   if [[ $(jq -r '.result.agent.agent_status // empty' <<<"$state" 2>/dev/null || true) == blocked ]]; then

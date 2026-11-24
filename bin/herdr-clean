@@ -66,7 +66,9 @@ have_herdr=false
 command -v "$herdr" >/dev/null && "$herdr" status server >/dev/null 2>&1 && have_herdr=true
 
 human() { awk -v k="$1" 'BEGIN { split("K M G T", u); i = 1; while (k >= 1024 && i < 4) { k /= 1024; i++ } printf (i == 1 ? "%d%s" : "%.1f%s"), k, u[i] }'; }
-size_k() { du -sk "$1" 2>/dev/null | cut -f1 || echo 0; }
+# One number, always: du exits non-zero on an unreadable subfolder but still prints a size,
+# and a second line here would split a plan row.
+size_k() { local k; k=$(du -sk "$1" 2>/dev/null | head -1 | cut -f1) || true; printf '%s' "${k:-0}"; }
 real() { (cd "$1" 2>/dev/null && pwd -P) || printf '%s' "$1"; }
 here=$(pwd -P)
 

@@ -62,7 +62,29 @@ The menu is a thin UI over two bash scripts in `bin/`, usable on their own (`-h`
   in the background (log: `~/.cache/herdr-start.log`, problems as herdr notifications).
 - `herdr-clean` — plan, confirm, clean. `-n` to only look.
 
-Naming rules: a Linear ticket keeps Linear's branch name (so Linear links the PR) and gets a short
-Claude title; a typed task gets a Claude branch in the style of the repo's recent branches (prefix
-via `git config herdr-start.branchPrefix`), deduplicated, or a slug if Claude does not answer in
-15 s; an exact branch name is used as is.
+## Naming
+
+Claude (the latest Sonnet, ~3 s) reads the task or ticket and answers with a **type** (`feat`,
+`fix`, ...), a **slug** (`empty-wallet-list-crash`) and a sidebar **title**. The branch is built
+from your format, so it never picks up someone's name from Linear or other branches.
+
+- A ticket that already has a branch carrying its ID (local or remote) reuses it, so earlier work
+  is picked up. Otherwise its branch is built from the format; the ID is always kept in the name,
+  since Linear links branches and PRs by it.
+- A new task branch that already exists gets `-2`, `-3`, ...
+- An exact branch name (no spaces) is used as typed.
+- No answer from Claude within 30 s: a plain slug, still in your format.
+
+Configure with git config, per repo or `--global` (an env var of the same name wins):
+
+| Key | Default | |
+| --- | --- | --- |
+| `herdr-start.branchFormat` | `{type}/{id}-{slug}` | `{id}` is empty for tasks and drops out with its separator: `fix/empty-wallet-list-crash`, `fix/eng-123-empty-wallet-list-crash` |
+| `herdr-start.branchTypes` | `feat fix chore refactor docs test perf ci` | the types Claude may choose |
+| `herdr-start.ticketBranch` | `format` | `linear`: use Linear's own branch name for tickets, as is |
+| `herdr-start.model` | `sonnet` | any `claude --model` value, e.g. `haiku` for speed |
+
+```sh
+git config --global herdr-start.branchFormat '{id}-{slug}'      # eng-123-empty-wallet-list-crash
+git config herdr-start.branchFormat '{type}/{slug}'             # this repo only; tickets still get their ID
+```

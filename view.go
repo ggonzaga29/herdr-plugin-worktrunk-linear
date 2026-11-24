@@ -199,17 +199,12 @@ func (m model) menuPreview(w, h int) string {
 			lines = append(lines, "")
 			lines = append(lines, names...)
 		}
-		lines = append(lines, "", stDim.Render("Branch, from Linear"))
 		d, ok := m.details[is.ID]
 		switch {
 		case !ok:
-			lines = append(lines, m.spin.View()+stDim.Render(" loading…"))
+			lines = append(lines, "", m.spin.View()+stDim.Render(" loading the description…"))
 		case d.Err != "":
-			lines = append(lines, stWarn.Render(d.Err))
-		case d.Branch != "":
-			lines = append(lines, d.Branch)
-		default:
-			lines = append(lines, stDim.Render("none; the ID is used"))
+			lines = append(lines, "", stWarn.Render(d.Err))
 		}
 		if ok && strings.TrimSpace(d.Description) != "" {
 			lines = append(lines, "")
@@ -225,7 +220,7 @@ func (m model) menuPreview(w, h int) string {
 		for len(lines) < room {
 			lines = append(lines, "")
 		}
-		lines = append(lines, stAccent.Render("Enter: the form, with a"), stAccent.Render("short title from Claude"))
+		lines = append(lines, stAccent.Render("Enter: the form, filled in"))
 	case rowClean:
 		title = "Clean worktrees"
 		lines = append(lines, wrap("Shows what would be removed in "+m.repoName(m.repo)+", with sizes and the reason for every skip, then asks before deleting anything.", inner)...)
@@ -250,11 +245,11 @@ func (m model) previewNames() []string {
 	case j.err != nil:
 		return []string{stWarn.Render("naming failed; the form retries")}
 	}
-	out := []string{stDim.Render("Title   ") + j.names.Title}
-	if m.rows[m.cursor].kind == rowNew {
-		out = append(out, stDim.Render("Branch  ")+j.names.Branch)
+	branch := j.names.Branch
+	if j.names.Where == "local" || j.names.Where == "remote" {
+		branch += stDim.Render("  exists")
 	}
-	return out
+	return []string{stDim.Render("Title   ") + j.names.Title, stDim.Render("Branch  ") + branch}
 }
 
 func (m model) viewForm() string {

@@ -331,9 +331,6 @@ func (m model) openForm(input, issueID string) (tea.Model, tea.Cmd) {
 				f.prompt = "Work on Linear " + issueID + ": " + is.Title + "."
 			}
 		}
-		if d, ok := m.details[issueID]; ok && d.Branch != "" {
-			f.branch = d.Branch
-		}
 	} else {
 		f.prompt = input
 	}

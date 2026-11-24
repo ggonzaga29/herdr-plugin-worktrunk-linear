@@ -14,13 +14,25 @@ Usage:
   herdr-start --names INPUT                     print the resolved branch, title and prompt as JSON
 
 Names:
-  ticket   branch = Linear's own branch name (or -B); title = "ENG-123 " + Claude's short version
-           of the ticket title; prompt = ID + title + how to read it, then [prompt...].
-  task     branch and title from Claude (Haiku, ~4 s), in the style of the repo's recent branches;
-           no answer within 15 s → a plain slug. prompt = [prompt...], or the task itself.
+  ticket   branch = an existing branch carrying the ticket ID if there is one (earlier work is
+           reused), else built from the branch format; title = "ENG-123 " + Claude's short title;
+           prompt = ID + title + how to read it, then [prompt...].
+  task     branch built from the branch format; title from Claude. prompt = [prompt...], or the task.
   branch   used as is; title = branch; prompt = [prompt...].
-  A prefix for Claude-named branches: $HERDR_START_BRANCH_PREFIX or `git config herdr-start.branchPrefix`.
-  A Claude-named branch that already exists gets -2, -3, ...; set HERDR_START_NO_CLAUDE=1 to skip Claude.
+  Claude (Sonnet, ~3 s) gives a type, a slug and a title; no answer within 30 s → a plain slug.
+  A new task branch that already exists gets -2, -3, ...; HERDR_START_NO_CLAUDE=1 skips Claude.
+
+Config (git config, in a repo or with --global; an env var of the same name wins):
+  herdr-start.branchFormat   HERDR_START_BRANCH_FORMAT   default "{type}/{id}-{slug}"
+      {type} feat, fix, ...  {id} ticket ID, lowercase (empty for tasks)  {slug} what changes.
+      Empty parts and their separators drop out: a task becomes "fix/empty-wallet-crash".
+      Examples: "{id}-{slug}", "{slug}", "gian/{id}-{slug}", "{type}-{slug}". A ticket's ID is
+      always kept in the name (added before {slug} if the format lacks it): Linear links by it.
+  herdr-start.branchTypes    HERDR_START_BRANCH_TYPES    default "feat fix chore refactor docs test perf ci"
+  herdr-start.ticketBranch   HERDR_START_TICKET_BRANCH   "format" (default) or "linear" (Linear's own
+      branch name, e.g. "gian/eng-123-title", as is)
+  herdr-start.model          HERDR_START_MODEL           default "sonnet" (the latest Sonnet)
+  Example: git config --global herdr-start.branchFormat '{id}-{slug}' 
 
 The branch is switched to if it exists locally or on the remote (fetched if needed), and created
 from the base otherwise. If the worktree is already open in herdr, its agent is focused (and the
@@ -125,8 +137,20 @@ command -v "$launcher" >/dev/null || die "agent command not found on PATH: $laun
 tmp=$(mktemp)
 trap 'rm -f "$tmp"' EXIT
 
+# ---------- naming config: git config (repo, then --global); env wins ----------
+cfg() { git config --get "herdr-start.$1" 2>/dev/null || true; }
+branch_format=${HERDR_START_BRANCH_FORMAT:-$(cfg branchFormat)}
+branch_format=${branch_format:-'{type}/{id}-{slug}'}
+branch_types=${HERDR_START_BRANCH_TYPES:-$(cfg branchTypes)}
+branch_types=${branch_types:-feat fix chore refactor docs test perf ci}
+ticket_branch=${HERDR_START_TICKET_BRANCH:-$(cfg ticketBranch)}
+ticket_branch=${ticket_branch:-format}
+[[ $ticket_branch == format || $ticket_branch == linear ]] || die "herdr-start.ticketBranch must be format or linear, not: $ticket_branch"
+model=${HERDR_START_MODEL:-$(cfg model)}
+model=${model:-sonnet}
+
 # ---------- Claude naming ----------
-# One structured Haiku call. Prints the structured JSON, or fails (no claude, error, timeout, junk).
+# One structured call (Sonnet by default). Prints the structured JSON, or fails (no claude, error, timeout, junk).
 ask_claude() {  # $1 = JSON schema, $2 = prompt
   [[ ${HERDR_START_NO_CLAUDE:-} == 1 ]] && return 1
   local cli out pid watcher rc
@@ -134,11 +158,11 @@ ask_claude() {  # $1 = JSON schema, $2 = prompt
   if [[ $launcher == claude || $launcher == claude-* ]]; then cli=$launcher; else cli=claude; fi
   command -v "$cli" >/dev/null || return 1
   out=$(mktemp)
-  MAX_THINKING_TOKENS=0 "$cli" -p --no-session-persistence --model haiku --tools '' --safe-mode \
+  MAX_THINKING_TOKENS=0 "$cli" -p --no-session-persistence --model "$model" --tools '' --safe-mode \
     --setting-sources user --output-format json --json-schema "$1" "$2" </dev/null >"$out" 2>/dev/null &
   pid=$!
   # The watcher must not hold our stdout open, or callers reading it wait out the sleep.
-  ( sleep "${HERDR_START_NAMING_TIMEOUT:-15}"; kill "$pid" 2>/dev/null ) </dev/null >/dev/null 2>&1 &
+  ( sleep "${HERDR_START_NAMING_TIMEOUT:-30}"; kill "$pid" 2>/dev/null ) </dev/null >/dev/null 2>&1 &
   watcher=$!
   if wait "$pid" 2>/dev/null; then
     kill "$watcher" 2>/dev/null || true
@@ -151,8 +175,6 @@ ask_claude() {  # $1 = JSON schema, $2 = prompt
   rm -f "$out"
   return $rc
 }
-
-branch_prefix() { printf '%s' "${HERDR_START_BRANCH_PREFIX:-$(git config --get herdr-start.branchPrefix 2>/dev/null || true)}"; }
 
 slugify() {  # text → lowercase-hyphen slug, at most 50 chars
   printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g; s/^-+//' | cut -c1-50 | sed -E 's/-+$//'
@@ -190,37 +212,70 @@ dedupe() {  # a NEW name must not collide with an existing branch: name, name-2,
   printf '%s' "$b"
 }
 
-name_task() {  # $1 = task text → sets branch, title, branch_src, title_src
-  local prefix recent schema ask json b='' t=''
-  prefix=$(branch_prefix)
-  recent=$(git for-each-ref --count=20 --sort=-committerdate --format='%(refname:short)' refs/heads | tr '\n' ' ')
-  schema='{"type":"object","properties":{"branch":{"type":"string"},"title":{"type":"string"}},"required":["branch","title"],"additionalProperties":false}'
-  ask="Name a git branch and a short workspace title for the task below.
-Branch: lowercase words joined by hyphens, at most 50 characters. Follow the naming style of this repo's recent branches (prefixes such as feat/ or fix/ only if they use them)${prefix:+; it must start with $prefix}. Recent branches: ${recent:-none}
-Title: at most 40 characters, sentence case, no trailing period.
-Task: $1"
-  if json=$(ask_claude "$schema" "$ask"); then
-    b=$(clean_branch "$(jq -r '.branch // ""' <<<"$json")") || b=''
-    t=$(jq -r '.title // ""' <<<"$json" | tr '\n' ' ' | sed 's/ *$//' | cut -c1-60)
-  fi
-  if [[ -n $b ]]; then
-    [[ -z $prefix || $b == "$prefix"* ]] || b=$prefix$b
-    branch_src=claude
-  else
-    b=$prefix$(slugify "$1")
-    branch_src=fallback
-  fi
-  [[ -n ${b#"$prefix"} ]] || die "cannot make a branch name from: $1"
-  branch=$(dedupe "$b")
-  if [[ -n ${t// /} ]]; then title=$t title_src=claude; else title=${1:0:60} title_src=fallback; fi
+# render_branch TYPE ID SLUG → a branch from the format. Empty parts and their separators drop out.
+render_branch() {
+  local b=$branch_format tk='{type}' ik='{id}' sk='{slug}' withid='{id}-{slug}'
+  # A ticket's ID must be in the name: Linear links branches and PRs by it.
+  if [[ -n $2 && $b != *"$ik"* ]]; then b=${b//$sk/$withid}; fi
+  b=${b//$tk/$1}
+  b=${b//$ik/$2}
+  b=${b//$sk/$3}
+  clean_branch "$b"
 }
 
-short_title() {  # $1 = ticket title → Claude's short version, or fails
-  local schema json t
-  schema='{"type":"object","properties":{"title":{"type":"string"}},"required":["title"],"additionalProperties":false}'
-  json=$(ask_claude "$schema" "Shorten this issue title to at most 40 characters for a terminal tab title. Keep the key nouns, drop bracketed tags and filler words, sentence case, no trailing period. Title: $1") || return 1
-  t=$(jq -r '.title // ""' <<<"$json" | tr '\n' ' ' | sed 's/ *$//' | cut -c1-50)
-  [[ -n ${t// /} ]] && printf '%s' "$t"
+# ask_names KIND TEXT [DETAILS] → sets n_type, n_slug, n_title from Claude; fails without an answer.
+ask_names() {
+  local enum schema ask json t
+  enum=$(printf '%s\n' $branch_types | jq -R . | jq -sc .)
+  schema='{"type":"object","properties":{"type":{"type":"string","enum":'$enum'},"slug":{"type":"string"},"title":{"type":"string"}},"required":["type","slug","title"],"additionalProperties":false}'
+  ask="You name git branches and sidebar titles for coding work. Give three fields.
+
+type: the kind of change, one of: $branch_types. fix = something broken (bugs, crashes, wrong behaviour); feat = new or changed behaviour; refactor = same behaviour, better code; chore = tooling, dependencies, upkeep; docs, test, perf, ci as usual.
+slug: 2 to 5 lowercase words joined by hyphens, at most 40 characters, naming what changes, most specific words first (e.g. empty-wallet-list-crash). Leave out the type, ticket IDs, people's names, and filler words such as the, update, issue, ticket.
+title: at most 40 characters, sentence case, no trailing period, readable at a glance in a sidebar (e.g. Fix crash on empty wallet list).
+
+"
+  if [[ $1 == ticket ]]; then
+    ask+="The work is a Linear ticket. Leave its ID and bracketed tags such as [iOS] out of slug and title.
+Ticket title: $2${3:+
+Ticket description (start):
+$3}"
+  else
+    ask+="Task: $2"
+  fi
+  json=$(ask_claude "$schema" "$ask") || return 1
+  n_type=$(jq -r '.type // ""' <<<"$json")
+  n_slug=$(jq -r '.slug // ""' <<<"$json")
+  t=$(jq -r '.title // ""' <<<"$json" | tr '\n' ' ' | sed 's/ *$//' | cut -c1-60)
+  n_title=$t
+  [[ -n $n_slug && -n ${n_title// /} ]]
+}
+
+# find_ticket_branch ID → an existing branch carrying the ID (local first, then remote), or nothing.
+find_ticket_branch() {
+  local re
+  re="(^|[/_-])$(tr '[:upper:]' '[:lower:]' <<<"$1")([^0-9]|\$)"
+  { git for-each-ref --format='%(refname:short)' refs/heads
+    git for-each-ref --format='%(refname:lstrip=3)' refs/remotes; } 2>/dev/null |
+    grep -v '^HEAD$' | grep -E -i -m1 "$re" || true
+}
+
+name_task() {  # $1 = task text → sets branch, title, branch_src, title_src
+  local b='' slug
+  n_type='' n_slug='' n_title=''
+  if ask_names task "$1"; then
+    b=$(render_branch "$n_type" '' "$n_slug") || b=''
+  fi
+  if [[ -n $b ]]; then
+    branch_src=claude
+  else
+    slug=$(slugify "$1" | cut -c1-40 | sed -E 's/-+$//')
+    b=$(render_branch '' '' "$slug") || b=''
+    branch_src=fallback
+  fi
+  [[ -n $b ]] || die "cannot make a branch name from: $1"
+  branch=$(dedupe "$b")
+  if [[ -n ${n_title// /} ]]; then title=$n_title title_src=claude; else title=${1:0:60} title_src=fallback; fi
 }
 
 # ---------- input: ticket, task, branch, or picker ----------
@@ -271,9 +326,26 @@ if [[ -n $candidate ]]; then
      id=$(jq -er '.identifier // empty' <<<"$issue" 2>/dev/null); then
     kindof=ticket
     ticket_title=$(jq -r '.title // ""' <<<"$issue")
-    branch=$(jq -r '.branchName // empty' <<<"$issue")
-    branch_src=linear
-    [[ -n $branch ]] || branch=$(tr '[:upper:]' '[:lower:]' <<<"$id")
+    linear_branch=$(jq -r '.branchName // empty' <<<"$issue")
+    idl=$(tr '[:upper:]' '[:lower:]' <<<"$id")
+    n_type='' n_slug='' n_title=''
+    existing=$(find_ticket_branch "$id")
+    # Claude is needed for the title, and for the branch unless one is given, exists, or is Linear's.
+    if [[ -z $title_opt ]] || [[ -z $branch_opt && -z $existing && $ticket_branch == format ]]; then
+      desc=$(jq -r '.description // ""' <<<"$issue" | head -c 800)
+      ask_names ticket "$ticket_title" "$desc" || true
+    fi
+    if [[ -n $existing ]]; then
+      branch=$existing branch_src=existing
+    elif [[ $ticket_branch == linear && -n $linear_branch ]]; then
+      branch=$linear_branch branch_src=linear
+    elif [[ -n $n_slug ]] && branch=$(render_branch "$n_type" "$idl" "$n_slug") && [[ -n $branch ]]; then
+      branch_src=claude
+    else
+      bare=$(sed -E 's/\[[^]]*\]//g' <<<"$ticket_title")
+      branch=$(render_branch '' "$idl" "$(slugify "$bare" | cut -c1-40 | sed -E 's/-+$//')")
+      branch_src=fallback
+    fi
   elif $strict; then
     reason=$(head -1 "$tmp" 2>/dev/null || true)
     command -v linear >/dev/null || reason="linear CLI not installed"
@@ -301,8 +373,10 @@ git check-ref-format --branch "$branch" >/dev/null 2>&1 || die "invalid branch n
 case $kindof in
   ticket)
     if [[ -n $title_opt ]]; then title=$title_opt title_src=typed
-    elif short=$(short_title "$ticket_title"); then title="$id $short" title_src=claude
-    else title="$id ${ticket_title:0:60}" title_src=fallback
+    elif [[ -n ${n_title// /} ]]; then title="$id $n_title" title_src=claude
+    else
+      bare=$(sed -E 's/\[[^]]*\] *//g' <<<"$ticket_title")
+      title="$id ${bare:0:60}" title_src=fallback
     fi
     # ponytail: title + ID only; the agent reads the full ticket itself, so ticket text never lands in the input unseen.
     prompt="Work on Linear $id: $ticket_title. Read it first with \`linear issue view $id\`.${extra:+ $extra}" ;;

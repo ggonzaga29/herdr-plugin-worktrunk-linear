@@ -11,7 +11,7 @@ command = ["go", "build", "-o", "build/herdr-wtl", "."]
 
 # Bind a key in ~/.config/herdr/config.toml:
 #   [[keys.command]]
-#   key = "prefix+shift+n"
+#   key = "prefix+t"
 #   type = "plugin_action"
 #   command = "ggonzaga29.worktrunk-linear.menu"
 #   description = "worktrees: new or clean"

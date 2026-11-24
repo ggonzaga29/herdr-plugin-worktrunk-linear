@@ -30,7 +30,7 @@ Bind a key in `~/.config/herdr/config.toml`, then `herdr server reload-config`:
 
 ```toml
 [[keys.command]]
-key = "prefix+shift+n"
+key = "prefix+t"
 type = "plugin_action"
 command = "ggonzaga29.worktrunk-linear.menu"
 description = "worktrees: new or clean"

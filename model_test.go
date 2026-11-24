@@ -1,6 +1,9 @@
 package main
 
 import (
+	"os"
+	"path/filepath"
+	"reflect"
 	"testing"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -9,7 +12,7 @@ import (
 func testModel() model {
 	m := newModel("")
 	m.repo = "/repo"
-	m.agents = []Agent{{"claude · personal", []string{"-a", "personal"}}}
+	m.agents = []Agent{{"claude", nil}, {"claude · team", []string{"-a", "team"}}}
 	m.prefs = prefs{}
 	return m
 }
@@ -43,7 +46,7 @@ func TestQueuedCreateLaunchesWhenNamesArrive(t *testing.T) {
 	if _, ok := cmd().(tea.QuitMsg); !ok {
 		t.Fatal("launch should quit the TUI")
 	}
-	want := []string{"--detach", "-B", "fix/login-loop", "--title", "Fix login loop", "--prompt", "fix the login loop", "-a", "personal"}
+	want := []string{"--detach", "-B", "fix/login-loop", "--title", "Fix login loop", "--prompt", "fix the login loop"}
 	if len(m.action.Args) != len(want) {
 		t.Fatalf("args = %q, want %q", m.action.Args, want)
 	}
@@ -118,5 +121,23 @@ func sampleIssues() []Issue {
 		{ID: "ENG-1", Title: "Todo thing with a rather long title that will need truncating somewhere", State: "Todo", StateType: "unstarted", StateColor: "#e2e2e2", Priority: 2, PriorityLabel: "High", Labels: []Label{{"Feature", "#BB87FC"}, {"Mobile", "#0EA5E9"}, {"Parity", "#4EA7FC"}}},
 		{ID: "ENG-2", Title: "In progress thing", State: "In Progress", StateType: "started", StateColor: "#f2c94c", Priority: 1, PriorityLabel: "Urgent"},
 		{ID: "ENG-3", Title: "Another todo", State: "Todo", StateType: "unstarted"},
+	}
+}
+
+func TestClaudeAccountsAreConfigDirs(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	for _, d := range []string{".claude", ".claude-team", ".claude-work", ".claude-worktrees"} {
+		if err := os.MkdirAll(filepath.Join(home, d), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, d := range []string{".claude-work", ".claude-team"} { // worktrees holds no .claude.json
+		if err := os.WriteFile(filepath.Join(home, d, ".claude.json"), []byte("{}"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got, want := claudeAccounts(), []string{"team", "work"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("claudeAccounts() = %q, want %q", got, want)
 	}
 }

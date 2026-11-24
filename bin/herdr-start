@@ -26,11 +26,11 @@ Config (git config, in a repo or with --global; an env var of the same name wins
   herdr-start.branchFormat   HERDR_START_BRANCH_FORMAT   default "{type}/{id}-{slug}"
       {type} feat, fix, ...  {id} ticket ID, lowercase (empty for tasks)  {slug} what changes.
       Empty parts and their separators drop out: a task becomes "fix/empty-wallet-crash".
-      Examples: "{id}-{slug}", "{slug}", "gian/{id}-{slug}", "{type}-{slug}". A ticket's ID is
+      Examples: "{id}-{slug}", "{slug}", "dev/{id}-{slug}", "{type}-{slug}". A ticket's ID is
       always kept in the name (added before {slug} if the format lacks it): Linear links by it.
   herdr-start.branchTypes    HERDR_START_BRANCH_TYPES    default "feat fix chore refactor docs test perf ci"
   herdr-start.ticketBranch   HERDR_START_TICKET_BRANCH   "format" (default) or "linear" (Linear's own
-      branch name, e.g. "gian/eng-123-title", as is)
+      branch name, e.g. "alex/eng-123-title", as is)
   herdr-start.model          HERDR_START_MODEL           default "sonnet" (the latest Sonnet)
   Example: git config --global herdr-start.branchFormat '{id}-{slug}' 
 
@@ -39,8 +39,9 @@ from the base otherwise. If the worktree is already open in herdr, its agent is 
 prompt typed if it is idle); if it has no agent, one is started in a new split.
 
 Options (anywhere on the line; `--` ends options):
-  -a, --account NAME  Claude account: "personal" (default) runs `claude`, any other name runs the
-                      wrapper `claude-NAME` (e.g. -a team). Also the account Claude names things with.
+  -a, --account NAME  Claude account (default: plain `claude`). NAME is a config dir ~/.claude-NAME
+                      (run with CLAUDE_CONFIG_DIR), or a wrapper `claude-NAME` on PATH, which wins.
+                      Also the account Claude names things with.
   -k, --kind CMD      agent command instead of claude (codex, gemini, opencode, ...); -k claude keeps -a
   -B, --branch NAME   use this branch name (forces branch mode, or overrides a ticket's branch)
   -b, --base REF      base for a new branch (default: worktrunk's default branch)
@@ -82,7 +83,7 @@ note() { printf 'herdr-start: %s\n' "$*" >&2; }
 # ---------- options (accepted anywhere; bash 3.2 safe) ----------
 herdr=${HERDR_BIN_PATH:-herdr}
 wt=${WORKTRUNK_BIN:-wt}
-account=personal kind='' base='' branch_opt='' title_opt='' prompt_opt='' prompt_set=false
+account='' kind='' base='' branch_opt='' title_opt='' prompt_opt='' prompt_set=false
 submit=false dry=false names_only=false
 pos=()
 while [[ $# -gt 0 ]]; do
@@ -120,19 +121,27 @@ for dep in git jq "$wt" "$herdr"; do
 done
 git rev-parse --show-toplevel >/dev/null 2>&1 || die "not inside a git repository"
 
-# Launcher = what gets typed into the new pane's shell. Accounts are wrapper scripts (claude-team
-# sets CLAUDE_CONFIG_DIR and syncs memory), so a new account is just a new claude-<name> on PATH.
-[[ $account =~ ^[A-Za-z0-9._-]+$ ]] || die "invalid account name: $account"
+# Launcher = what gets typed into the new pane's shell. A Claude account is a config dir:
+# the default one, or ~/.claude-NAME (CLAUDE_CONFIG_DIR). A claude-NAME wrapper on PATH wins,
+# since wrappers can do more than set the dir (sync memory, guard against misuse).
+[[ $account == default ]] && account=''
+[[ -z $account || $account =~ ^[A-Za-z0-9._-]+$ ]] || die "invalid account name: $account"
 [[ -z $kind || $kind =~ ^[A-Za-z0-9._-]+$ ]] || die "invalid agent command: $kind"
+agent_cmd=''
 if [[ -n $kind && $kind != claude ]]; then
-  [[ $account == personal ]] || note "ignoring -a $account: accounts only apply to claude"
+  [[ -z $account ]] || note "ignoring -a $account: accounts only apply to claude"
   launcher=$kind
-elif [[ $account == personal ]]; then
+elif [[ -z $account ]]; then
   launcher=claude
-else
+elif command -v "claude-$account" >/dev/null; then
   launcher=claude-$account
+elif [[ -f $HOME/.claude-$account/.claude.json ]]; then
+  export CLAUDE_CONFIG_DIR="$HOME/.claude-$account"  # for naming; the pane gets it on the line below
+  launcher="CLAUDE_CONFIG_DIR=$(printf %q "$CLAUDE_CONFIG_DIR") claude" agent_cmd=claude
+else
+  die "no Claude account \"$account\": expected a config dir ~/.claude-$account (with .claude.json) or a claude-$account wrapper on PATH"
 fi
-command -v "$launcher" >/dev/null || die "agent command not found on PATH: $launcher"
+command -v "${agent_cmd:-$launcher}" >/dev/null || die "agent command not found on PATH: ${agent_cmd:-$launcher}"
 
 tmp=$(mktemp)
 trap 'rm -f "$tmp"' EXIT

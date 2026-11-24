@@ -3,30 +3,39 @@
 One [herdr](https://herdr.dev) popup to start work or clean up, built on
 [worktrunk](https://worktrunk.dev) and Linear:
 
-- **New work.** Pick one of your Linear issues, or type what you want to do. Claude (Haiku, ~4 s)
-  names the branch and a short workspace title; a form shows every field filled in, editable.
-  Create runs worktrunk (its hooks included), opens the worktree as a herdr workspace, starts your
-  agent, and types the prompt for you to review. The popup closes as soon as the agent launches.
+- **New work.** Pick one of your Linear issues, or type what you want to do. Claude names the
+  branch and a short workspace title while you look (see [Naming](#naming)); the form shows every
+  field filled in, and you can type over any of them. Create runs worktrunk (its hooks included),
+  opens the worktree as a herdr workspace, starts your agent, and types the prompt for you to
+  review. The popup closes as soon as the agent launches.
 - **Clean.** Shows what would go — idle worktrees, stale records, empty leftover folders, Xcode
   caches for deleted worktrees — with sizes and the reason for every skip, and asks before deleting.
 
 ## Requirements
 
-- herdr 0.9.5+, macOS
-- `wt` (worktrunk), `git`, `jq`, Go (to build the menu)
-- Optional: the `linear` CLI (for issues; a repo needs a `.linear.toml`, made with `linear config`),
-  `claude` (for naming; without it, branches are plain slugs)
+- herdr 0.9.5+ on macOS or Linux
+- `git`, `jq`
+- [worktrunk](https://worktrunk.dev) (`wt`): `brew install worktrunk`
+- [linear-cli](https://github.com/schpet/linear-cli) (`linear`, tested with 2.5.0):
+  `brew install schpet/tap/linear`, then `linear auth login`. A repo shows issues once it has a
+  `.linear.toml` (run `linear config` in it); without one you can still start work from a typed task.
+- Optional: [Claude Code](https://claude.com/claude-code) (`claude`) to name branches and titles;
+  without it, branches are plain slugs. It runs on your Claude login, not an API key.
+
+The menu lists any required tool it can't find, with the command to install it.
 
 ## Install
 
 ```sh
-git clone https://github.com/ggonzaga29/herdr-plugin-worktrunk-linear.git
-cd herdr-plugin-worktrunk-linear
-go build -o build/herdr-wtl .
-herdr plugin link "$PWD"
+herdr plugin install ggonzaga29/herdr-plugin-worktrunk-linear
 ```
 
-Bind a key in `~/.config/herdr/config.toml`, then `herdr server reload-config`:
+The install downloads the menu's prebuilt binary for your platform from the matching GitHub
+release and checks it against `checksums.txt`. If there is none, it builds from source, which
+needs [Go](https://go.dev/dl) 1.24+.
+
+Then bind a key in `~/.config/herdr/config.toml` (herdr has no way for a plugin to bind one
+itself) and run `herdr server reload-config`:
 
 ```toml
 [[keys.command]]
@@ -36,22 +45,40 @@ command = "ggonzaga29.worktrunk-linear.menu"
 description = "worktrees: new or clean"
 ```
 
-Optional: put the engines on your PATH for terminal use:
+Optional: to use the engines from a terminal too, clone the repo and
 `ln -s "$PWD/bin/herdr-start" "$PWD/bin/herdr-clean" ~/.local/bin/`.
 
 ## The menu
 
 | Key | Does |
 | --- | --- |
-| type | filters issues; a `+ New worktree: "…"` row starts work from what you typed |
+| type | filters issues; a `+ New worktree "…"` row starts work from what you typed |
+| ↑ ↓ | move |
 | enter | open the form (issue or new) or Clean |
 | alt-c | Clean, from anywhere |
-| esc | close (or back, in the form) |
+| esc | close |
 
-In the form, Enter on a row edits it (Title, Branch, Prompt) or opens a list (Base, Project,
-Agent); Enter on Create launches. Agents: `claude` per account (any `claude-<name>` wrapper on
-PATH, e.g. `claude-team`), plus codex, gemini, opencode and others found on PATH. The last agent
-per repo is remembered.
+In the form:
+
+| Key | Does |
+| --- | --- |
+| ↑ ↓, tab | move between fields |
+| type | edit Title, Branch or Prompt in place; an edited field keeps your text when Claude answers |
+| ← → | change Base, Project or Agent |
+| enter | next field; opens the list on Base or Project; launches on Create |
+| ctrl+s | create, from any field (waits for Claude's names if they are still coming) |
+| esc | back to the menu |
+
+### Agents and Claude accounts
+
+The Agent field offers `claude`, one entry per extra Claude account, then codex, gemini,
+opencode, cursor-agent, amp and pi when they are on PATH. The last agent per repo is remembered.
+
+An extra Claude account is a config dir `~/.claude-<name>` that holds a `.claude.json`, which
+is what running `CLAUDE_CONFIG_DIR=~/.claude-<name> claude` and logging in leaves behind. Each one
+shows up as `claude · <name>` and starts with that `CLAUDE_CONFIG_DIR`. If a wrapper script
+`claude-<name>` is on PATH, it is used instead, so a wrapper that does more (syncs memory,
+checks something first) keeps working.
 
 ## The engines
 
@@ -88,3 +115,17 @@ Configure with git config, per repo or `--global` (an env var of the same name w
 git config --global herdr-start.branchFormat '{id}-{slug}'      # eng-123-empty-wallet-list-crash
 git config herdr-start.branchFormat '{type}/{slug}'             # this repo only; tickets still get their ID
 ```
+
+## Releasing
+
+`scripts/release.sh 0.3.0` (from a clean `main`) sets the manifest version, builds the menu for
+macOS and Linux on arm64 and amd64, commits `checksums.txt`, tags `v0.3.0`, pushes, and uploads
+the binaries as a GitHub release. Bump the version whenever the Go code changes, so installs
+get a binary that matches the scripts beside it.
+
+For development, clone the repo, run `sh scripts/build.sh` (or `go build -o build/herdr-wtl .`),
+and `herdr plugin link "$PWD"`; linking does not run the build.
+
+## License
+
+MIT

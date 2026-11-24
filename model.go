@@ -116,6 +116,7 @@ type model struct {
 	pick        pick
 	spin        spinner.Model
 	flash       string
+	missing     []string // required CLIs not on PATH, shown above the list
 
 	action *Action
 }
@@ -168,6 +169,7 @@ func newModel(repo string) model {
 		jobs:          map[string]*nameJob{},
 		bases:         map[string][]string{},
 		agents:        listAgents(),
+		missing:       missingTools(),
 		prefs:         loadPrefs(),
 		issuesLoading: repo != "",
 	}

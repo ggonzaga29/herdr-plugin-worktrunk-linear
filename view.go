@@ -204,21 +204,6 @@ func segsWidth(ss []seg) int {
 	return w
 }
 
-// launcherName is what the chosen agent types into the new pane.
-func (m model) launcherName() string {
-	if len(m.agents) == 0 {
-		return "agent"
-	}
-	a := m.agents[m.form.agent]
-	if a.Args[0] == "-a" {
-		if a.Args[1] == "personal" {
-			return "claude"
-		}
-		return "claude-" + a.Args[1]
-	}
-	return a.Args[1]
-}
-
 func (m model) agentLabel(i int) string {
 	if i < len(m.agents) {
 		return m.agents[i].Label
@@ -256,7 +241,10 @@ func (m model) viewMenu() string {
 	in.Width = max(10, left-6-segsWidth(count))
 	lines := []string{paint(left, "", []seg{{stAccent.Bold(true), " ❯ "}, {stPlain, in.View()}}, count), ""}
 
-	listH := bodyH - 2
+	for _, t := range m.missing {
+		lines = append(lines, paint(left, "", []seg{{stWarn, "   " + t}}, nil))
+	}
+	listH := bodyH - len(lines)
 	start := 0
 	if m.cursor >= listH {
 		start = m.cursor - listH + 1
@@ -523,7 +511,7 @@ func (m model) viewForm() string {
 		btn = lipgloss.NewStyle().Background(lipgloss.Color(pal.accent)).Foreground(lipgloss.Color("#101010")).Bold(true)
 		label = " Create ⏎ "
 	}
-	note := []seg{{stFaint, "worktree → herdr workspace → " + m.launcherName() + ", prompt typed, not sent"}}
+	note := []seg{{stFaint, "worktree → herdr workspace → " + m.agentLabel(m.form.agent) + ", prompt typed, not sent"}}
 	switch {
 	case f.queued:
 		note = []seg{{stAccent, m.spin.View() + " starting as soon as the names arrive"}, {stFaint, " · esc cancels"}}

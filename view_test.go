@@ -30,6 +30,10 @@ func TestViewsFit(t *testing.T) {
 			}
 		}
 		check("menu", m)
+		mt := m
+		mt.missing = []string{"wt not found: brew install worktrunk", "linear not found: brew install schpet/tap/linear, then linear auth login"}
+		mt.cursor = len(mt.rows) - 1 // scrolled to the bottom with the warnings above
+		check("menu missing tools", mt)
 		m.input.SetValue("make settings remember the tab")
 		m.refilter()
 		check("menu typing", m)

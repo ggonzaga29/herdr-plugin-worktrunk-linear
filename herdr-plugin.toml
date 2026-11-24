@@ -3,11 +3,12 @@ name = "Worktrunk + Linear"
 version = "0.1.0"
 min_herdr_version = "0.9.5"
 description = "One menu: start work in a worktrunk worktree from a Linear issue or a typed task (Claude names it), or clean up idle worktrees"
-platforms = ["macos"]
+platforms = ["macos", "linux"]
 
-# Builds build/herdr-wtl (needs Go). `herdr plugin link` skips this: run `go build -o build/herdr-wtl .` yourself.
+# Puts the menu at build/herdr-wtl: the prebuilt binary from this version's GitHub release,
+# or a Go build when none fits. `herdr plugin link` skips this: run `sh scripts/build.sh` yourself.
 [[build]]
-command = ["go", "build", "-o", "build/herdr-wtl", "."]
+command = ["sh", "scripts/build.sh"]
 
 # Bind a key in ~/.config/herdr/config.toml:
 #   [[keys.command]]

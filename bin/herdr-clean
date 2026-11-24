@@ -36,7 +36,7 @@ Options:
 Examples:
   herdr-clean -n                 see what would go in this repo
   herdr-clean                    plan, confirm, clean this repo
-  herdr-clean ~/workspace/guardis-frontend ~/workspace/guardis-ios --pnpm
+  herdr-clean ~/code/web ~/code/ios --pnpm
 EOF
 }
 

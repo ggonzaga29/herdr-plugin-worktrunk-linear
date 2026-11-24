@@ -211,7 +211,7 @@ func repoRoot(dir string) string {
 
 func loadIssues(repo string) ([]Issue, error) {
 	if _, err := exec.LookPath("linear"); err != nil {
-		return nil, errors.New("linear CLI not installed")
+		return nil, errors.New("linear CLI not installed: brew install schpet/tap/linear")
 	}
 	out, err := runFor(30*time.Second, repo, "linear", "issue", "query", "--json", "--assignee", "self",
 		"--state", "started", "--state", "unstarted", "--limit", "100")
@@ -350,6 +350,40 @@ func listProjects(current string) []string {
 	return ps
 }
 
+// claudeAccounts names the extra Claude accounts: config dirs ~/.claude-<name> holding a
+// .claude.json, the layout CLAUDE_CONFIG_DIR=~/.claude-<name> leaves behind. The default
+// account (plain `claude`) is not listed. herdr-start prefers a claude-<name> wrapper if one exists.
+func claudeAccounts() []string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return nil
+	}
+	files, _ := filepath.Glob(filepath.Join(home, ".claude-*", ".claude.json"))
+	var names []string
+	for _, f := range files { // Glob sorts
+		if n := strings.TrimPrefix(filepath.Base(filepath.Dir(f)), ".claude-"); accountRE.MatchString(n) {
+			names = append(names, n)
+		}
+	}
+	return names
+}
+
+// missingTools lists the required CLIs that are not on PATH, each with how to get it.
+func missingTools() []string {
+	var out []string
+	for _, t := range [][2]string{
+		{"git", "git"},
+		{"jq", "brew install jq"},
+		{"wt", "brew install worktrunk"},
+		{"linear", "brew install schpet/tap/linear, then linear auth login"},
+	} {
+		if _, err := exec.LookPath(t[0]); err != nil {
+			out = append(out, t[0]+" not found: "+t[1])
+		}
+	}
+	return out
+}
+
 func herdrBin() string {
 	if b := os.Getenv("HERDR_BIN_PATH"); b != "" {
 		return b
@@ -357,35 +391,16 @@ func herdrBin() string {
 	return "herdr"
 }
 
-var accountRE = regexp.MustCompile(`^claude-([a-z0-9]+)$`)
+var accountRE = regexp.MustCompile(`^[A-Za-z0-9._-]+$`)
 
-// listAgents: claude on each account (claude-<name> wrappers on PATH), then other agent CLIs.
+// listAgents: claude once per Claude account, then other agent CLIs.
 func listAgents() []Agent {
 	var agents []Agent
 	if _, err := exec.LookPath("claude"); err == nil {
-		agents = append(agents, Agent{"claude · personal", []string{"-a", "personal"}})
-	}
-	seen := map[string]bool{}
-	var accounts []string
-	for _, dir := range filepath.SplitList(os.Getenv("PATH")) {
-		entries, err := os.ReadDir(dir)
-		if err != nil {
-			continue
+		agents = append(agents, Agent{"claude", nil})
+		for _, a := range claudeAccounts() {
+			agents = append(agents, Agent{"claude · " + a, []string{"-a", a}})
 		}
-		for _, e := range entries {
-			m := accountRE.FindStringSubmatch(e.Name())
-			if m == nil || seen[m[1]] {
-				continue
-			}
-			if st, err := os.Stat(filepath.Join(dir, e.Name())); err == nil && st.Mode()&0o111 != 0 {
-				seen[m[1]] = true
-				accounts = append(accounts, m[1])
-			}
-		}
-	}
-	sort.Strings(accounts)
-	for _, a := range accounts {
-		agents = append(agents, Agent{"claude · " + a, []string{"-a", a}})
 	}
 	for _, k := range []string{"codex", "gemini", "opencode", "cursor-agent", "amp", "pi"} {
 		if _, err := exec.LookPath(k); err == nil {

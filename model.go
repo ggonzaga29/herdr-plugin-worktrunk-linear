@@ -40,6 +40,7 @@ func (r row) selectable() bool { return r.kind != rowGroup }
 const (
 	fTitle = iota
 	fBranch
+	fHint // how Claude should name this one
 	fBase
 	fProject
 	fAgent
@@ -48,7 +49,7 @@ const (
 	fieldCount
 )
 
-func isText(f int) bool { return f == fTitle || f == fBranch || f == fPrompt }
+func isText(f int) bool { return f == fTitle || f == fBranch || f == fHint || f == fPrompt }
 
 // Action is what runs after the TUI exits, with the terminal handed over.
 type Action struct {
@@ -67,7 +68,7 @@ type form struct {
 	agent          int
 	edited         [fieldCount]bool // fields you changed: a late naming answer leaves them alone
 	cursor         int
-	key            string // the naming job this form waits on (repo, input, agent)
+	key            string // the naming job this form waits on (repo, input, hint, agent)
 	queued         bool   // Create was pressed while naming: launch as soon as the names arrive
 }
 
@@ -80,7 +81,9 @@ type nameJob struct {
 	err   error
 }
 
-func nameKey(dir, input string, a Agent) string { return dir + "\x00" + input + "\x00" + a.Label }
+func nameKey(dir, input, hint string, a Agent) string {
+	return dir + "\x00" + input + "\x00" + hint + "\x00" + a.Label
+}
 
 type pick struct {
 	field   int
@@ -110,6 +113,7 @@ type model struct {
 	form     form
 	inTitle  textinput.Model
 	inBranch textinput.Model
+	inHint   textinput.Model
 	inPrompt textarea.Model
 	jobs     map[string]*nameJob
 	pick     pick
@@ -157,11 +161,15 @@ func newModel(repo string) model {
 	ta.SetHeight(3)
 	ta.FocusedStyle.CursorLine = ta.FocusedStyle.CursorLine.UnsetBackground()
 
+	hint := field()
+	hint.Placeholder = "optional: tell Claude how to name this one"
+
 	m := model{
 		repo:          repo,
 		input:         in,
 		inTitle:       field(),
 		inBranch:      field(),
+		inHint:        hint,
 		inPrompt:      ta,
 		spin:          spinner.New(spinner.WithSpinner(spinner.MiniDot), spinner.WithStyle(stAccent)),
 		details:       map[string]IssueDetail{},
@@ -309,7 +317,7 @@ func (m *model) wantDetail() tea.Cmd {
 // layout sizes the form's inputs to the window.
 func (m *model) layout() {
 	w := max(10, min(m.width, formMaxWidth)-formLabelWidth-22) // room for the badge column
-	m.inTitle.Width, m.inBranch.Width = w, w
+	m.inTitle.Width, m.inBranch.Width, m.inHint.Width = w, w, w
 	m.inPrompt.SetWidth(w)
 }
 
@@ -416,6 +424,7 @@ func (m model) openForm(input, issueID string) (tea.Model, tea.Cmd) {
 	}
 	m.inTitle.SetValue("")
 	m.inBranch.SetValue("")
+	m.inHint.SetValue("")
 	m.inPrompt.SetValue(prompt)
 	if m.form.project == "" {
 		m.form.cursor = fProject
@@ -428,6 +437,7 @@ func (m model) openForm(input, issueID string) (tea.Model, tea.Cmd) {
 func (m *model) focusField() tea.Cmd {
 	m.inTitle.Blur()
 	m.inBranch.Blur()
+	m.inHint.Blur()
 	m.inPrompt.Blur()
 	switch m.form.cursor {
 	case fTitle:
@@ -436,6 +446,9 @@ func (m *model) focusField() tea.Cmd {
 	case fBranch:
 		m.inBranch.CursorEnd()
 		return m.inBranch.Focus()
+	case fHint:
+		m.inHint.CursorEnd()
+		return m.inHint.Focus()
 	case fPrompt:
 		m.inPrompt.CursorEnd()
 		return m.inPrompt.Focus()
@@ -470,19 +483,19 @@ func (m model) highlighted() string {
 }
 
 // ensureNames starts a naming job unless one for the same key is running or has succeeded.
-func (m *model) ensureNames(dir, input string, agent Agent) tea.Cmd {
-	k := nameKey(dir, input, agent)
+func (m *model) ensureNames(dir, input, hint string, agent Agent) tea.Cmd {
+	k := nameKey(dir, input, hint, agent)
 	if j, ok := m.jobs[k]; ok && (!j.done || j.err == nil) {
 		return nil
 	}
 	m.jobs[k] = &nameJob{start: time.Now()}
 	return func() tea.Msg {
-		n, err := resolveNames(dir, input, agent)
+		n, err := resolveNames(dir, input, hint, agent)
 		return namesMsg{k, n, err}
 	}
 }
 
-// forgetNames drops names Claude gave for another project, keeping your edits.
+// forgetNames drops names Claude gave for another project or naming hint, keeping your edits.
 func (m *model) forgetNames() {
 	f := &m.form
 	f.names, f.naming, f.queued, f.key, f.nameErr = Names{}, false, false, "", ""
@@ -502,8 +515,9 @@ func (m *model) startNaming() tea.Cmd {
 	}
 	f.nameErr, f.queued = "", false
 	agent := m.agents[f.agent]
-	cmd := m.ensureNames(f.project, f.input, agent)
-	f.key = nameKey(f.project, f.input, agent)
+	hint := strings.TrimSpace(m.inHint.Value())
+	cmd := m.ensureNames(f.project, f.input, hint, agent)
+	f.key = nameKey(f.project, f.input, hint, agent)
 	if j := m.jobs[f.key]; j.done {
 		f.naming = false
 		m.applyNames(j.names)
@@ -563,6 +577,8 @@ func (m model) fieldText(f int) string {
 		return m.inTitle.Value()
 	case fBranch:
 		return m.inBranch.Value()
+	case fHint:
+		return m.inHint.Value()
 	case fPrompt:
 		return m.inPrompt.Value()
 	}
@@ -582,6 +598,7 @@ func (m model) updateForm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.screen = scMenu
 		m.inTitle.Blur()
 		m.inBranch.Blur()
+		m.inHint.Blur()
 		m.inPrompt.Blur()
 		return m, nil
 	case "up", "shift+tab":
@@ -623,11 +640,16 @@ func (m model) updateForm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.inTitle, cmd = m.inTitle.Update(msg)
 	case fBranch:
 		m.inBranch, cmd = m.inBranch.Update(msg)
+	case fHint:
+		m.inHint, cmd = m.inHint.Update(msg)
 	case fPrompt:
 		m.inPrompt, cmd = m.inPrompt.Update(msg)
 	}
 	if m.fieldText(f.cursor) != before {
 		f.edited[f.cursor] = true
+		if f.cursor == fHint { // names given under the old hint no longer hold: Create asks again
+			m.forgetNames()
+		}
 	}
 	return m, cmd
 }

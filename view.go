@@ -455,8 +455,8 @@ func (m model) viewForm() string {
 	}
 	lines = append(lines, "")
 
-	labels := map[int]string{fTitle: "Title", fBranch: "Branch", fBase: "Base", fProject: "Project", fAgent: "Agent", fPrompt: "Prompt"}
-	for _, fld := range []int{fTitle, fBranch, fBase, fProject, fAgent, fPrompt} {
+	labels := map[int]string{fTitle: "Title", fBranch: "Branch", fHint: "Naming", fBase: "Base", fProject: "Project", fAgent: "Agent", fPrompt: "Prompt"}
+	for _, fld := range []int{fTitle, fBranch, fHint, fBase, fProject, fAgent, fPrompt} {
 		sel := f.cursor == fld
 		bar, label := seg{stPlain, " "}, stMuted
 		if sel {
@@ -542,6 +542,14 @@ func (m model) fieldValue(fld int, sel bool) []seg {
 			return []seg{{stAccent, "✦"}, {stFaint, " " + in.Placeholder}}
 		}
 		return []seg{{stText, in.Value()}}
+	case fHint:
+		switch {
+		case sel:
+			return []seg{{stPlain, m.inHint.View()}}
+		case m.inHint.Value() == "":
+			return []seg{{stFaint, m.inHint.Placeholder}}
+		}
+		return []seg{{stText, m.inHint.Value()}}
 	}
 	var v string
 	switch fld {

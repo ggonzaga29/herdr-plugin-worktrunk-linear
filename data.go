@@ -271,8 +271,11 @@ func loadDetail(repo, id string) IssueDetail {
 }
 
 // resolveNames asks the engine how it would name this input, without creating anything.
-func resolveNames(repo, input string, agent Agent) (Names, error) {
+func resolveNames(repo, input, hint string, agent Agent) (Names, error) {
 	args := append([]string{"--names"}, agent.Args...)
+	if hint != "" {
+		args = append(args, "--naming", hint)
+	}
 	args = append(args, "--", input)
 	// Claude is capped at 15 s inside; this also covers a hung Linear lookup for tickets.
 	out, err := runFor(45*time.Second, repo, engine("herdr-start"), args...)

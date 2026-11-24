@@ -31,7 +31,7 @@ func TestNamingWaitsForCreate(t *testing.T) {
 	}
 
 	// An answer for some other input changes nothing.
-	other := namesMsg{key: nameKey("/repo", "something else", m.agents[0]), names: Names{Branch: "wrong", Title: "Wrong"}}
+	other := namesMsg{key: nameKey("/repo", "something else", "", m.agents[0]), names: Names{Branch: "wrong", Title: "Wrong"}}
 	tm, _ = m.gotNames(other)
 	m = tm.(model)
 	if m.action != nil || m.inBranch.Value() == "wrong" {
@@ -87,6 +87,42 @@ func TestTypingBeatsLateNames(t *testing.T) {
 	m = tm.(model)
 	if m.action == nil || m.inBranch.Value() != "fix/mine" || m.inTitle.Value() != "Claude title" {
 		t.Fatalf("names must fill only untouched fields: branch=%q title=%q", m.inBranch.Value(), m.inTitle.Value())
+	}
+}
+
+// The Naming field is sent to Claude, and changing it asks again.
+func TestNamingHintRenames(t *testing.T) {
+	m := testModel()
+	tm, _ := m.openForm("fix the login loop", "")
+	m = tm.(model)
+	typeHint := func(s string) {
+		m.form.cursor = fHint
+		m.focusField()
+		for _, r := range s {
+			tm, _ = m.updateForm(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}})
+			m = tm.(model)
+		}
+	}
+	typeHint("start with web")
+	tm, _ = m.create()
+	m = tm.(model)
+	if want := nameKey("/repo", "fix the login loop", "start with web", m.agents[0]); m.form.key != want || m.jobs[want] == nil {
+		t.Fatalf("Create should name with the hint: key=%q", m.form.key)
+	}
+	m.form.queued = false // names arrive, but you keep editing
+	tm, _ = m.gotNames(namesMsg{key: m.form.key, names: Names{Branch: "fix/web-login-loop", Title: "Fix web login loop"}})
+	m = tm.(model)
+	if m.inBranch.Value() != "fix/web-login-loop" {
+		t.Fatalf("names should fill the form: branch=%q", m.inBranch.Value())
+	}
+	typeHint("-app")
+	if m.inBranch.Value() != "" || m.form.names.Branch != "" {
+		t.Fatal("a changed hint should drop the old names")
+	}
+	tm, _ = m.create()
+	m = tm.(model)
+	if !m.form.naming || m.action != nil {
+		t.Fatal("Create should ask Claude again under the new hint")
 	}
 }
 

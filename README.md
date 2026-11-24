@@ -101,6 +101,8 @@ from your format, so it never picks up someone's name from Linear or other branc
 - A new task branch that already exists gets `-2`, `-3`, ...
 - An exact branch name (no spaces) is used as typed.
 - No answer from Claude within 30 s: a plain slug, still in your format.
+- The form's **Naming** field tells Claude how to name that one branch, in plain words
+  ("start the slug with web"). On the command line: `herdr-start --naming "..."`.
 
 Configure with git config, per repo or `--global` (an env var of the same name wins):
 

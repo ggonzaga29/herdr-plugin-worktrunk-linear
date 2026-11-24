@@ -49,6 +49,7 @@ Options (anywhere on the line; `--` ends options):
   -B, --branch NAME   use this branch name (forces branch mode, or overrides a ticket's branch)
   -b, --base REF      base for a new branch (default: worktrunk's default branch)
       --title TEXT    herdr workspace title (skips Claude's title)
+      --naming TEXT   for this branch only: tell Claude how to name it, in plain words
       --prompt TEXT   the whole prompt, replacing the one built from the ticket or task
   -s, --submit        submit the prompt; default only types it into the agent's input
   -d, --detach        once the agent is launched, finish (startup questions, rename, prompt) in the
@@ -86,14 +87,14 @@ note() { printf 'herdr-start: %s\n' "$*" >&2; }
 # ---------- options (accepted anywhere; bash 3.2 safe) ----------
 herdr=${HERDR_BIN_PATH:-herdr}
 wt=${WORKTRUNK_BIN:-wt}
-account='' kind='' base='' branch_opt='' title_opt='' prompt_opt='' prompt_set=false
+account='' kind='' base='' branch_opt='' title_opt='' naming_opt='' prompt_opt='' prompt_set=false
 submit=false dry=false names_only=false
 pos=()
 while [[ $# -gt 0 ]]; do
   case $1 in
     --*=*) set -- "${1%%=*}" "${1#*=}" "${@:2}"; continue ;;
     -h|--help) usage; exit 0 ;;
-    -a|--account|-k|--kind|-b|--base|-B|--branch|--title)
+    -a|--account|-k|--kind|-b|--base|-B|--branch|--title|--naming)
       [[ $# -ge 2 && -n $2 ]] || die "$1 needs a value (see --help)"
       case $1 in
         -a|--account) account=$2 ;;
@@ -101,6 +102,7 @@ while [[ $# -gt 0 ]]; do
         -b|--base) base=$2 ;;
         -B|--branch) branch_opt=$2 ;;
         --title) title_opt=$2 ;;
+        --naming) naming_opt=$2 ;;
       esac
       shift 2 ;;
     --prompt)  # may be empty on purpose: no prompt at all
@@ -161,6 +163,7 @@ ticket_branch=${ticket_branch:-format}
 model=${HERDR_START_MODEL:-$(cfg model)}
 model=${model:-sonnet}
 naming_prompt=${HERDR_START_NAMING_PROMPT:-$(cfg namingPrompt)}
+[[ -n $naming_opt ]] && naming_prompt+=${naming_prompt:+$'\n'}"For this branch: $naming_opt"
 
 # ---------- Claude naming ----------
 # One structured call (Sonnet by default). Prints the structured JSON, or fails (no claude, error, timeout, junk).
@@ -248,7 +251,7 @@ slug: 2 to 5 lowercase words joined by hyphens, at most 40 characters, naming wh
 title: at most 40 characters, sentence case, no trailing period, readable at a glance in a sidebar (e.g. Fix crash on empty wallet list).
 
 "
-  [[ -n $naming_prompt ]] && ask+="Instructions from the user for this repo. Where they disagree with the rules above, follow these:
+  [[ -n $naming_prompt ]] && ask+="Instructions from the user. Where they disagree with the rules above, follow these:
 $naming_prompt
 
 "

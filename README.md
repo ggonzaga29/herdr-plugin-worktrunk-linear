@@ -4,7 +4,7 @@ One [herdr](https://herdr.dev) popup to start work or clean up, built on
 [worktrunk](https://worktrunk.dev) and Linear:
 
 - **New work.** Pick one of your Linear issues, or type what you want to do. Claude names the
-  branch and a short workspace title while you look (see [Naming](#naming)); the form shows every
+  branch and a short workspace title when the form opens (see [Naming](#naming)); the form shows every
   field filled in, and you can type over any of them. Create runs worktrunk (its hooks included),
   opens the worktree as a herdr workspace, starts your agent, and types the prompt for you to
   review. The popup closes as soon as the agent launches.
@@ -102,7 +102,7 @@ from your format, so it never picks up someone's name from Linear or other branc
 - An exact branch name (no spaces) is used as typed.
 - No answer from Claude within 30 s: a plain slug, still in your format.
 - The form's **Naming** field tells Claude how to name that one branch, in plain words
-  ("start the slug with web"). On the command line: `herdr-start --naming "..."`.
+  ("start the slug with web"); the names refresh when you leave the field. On the command line: `herdr-start --naming "..."`.
 
 Configure with git config, per repo or `--global` (an env var of the same name wins):
 

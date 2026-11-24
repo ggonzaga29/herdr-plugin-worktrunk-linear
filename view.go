@@ -350,7 +350,7 @@ func (m model) menuPreview(w int) []string {
 		add(seg{stBold, "New worktree"})
 		text(stMuted, strings.TrimSpace(m.input.Value()))
 		out = append(out, "")
-		text(stFaint, "Claude names the branch and title when you create. An exact branch name, with no spaces, is used as typed.")
+		text(stFaint, "Claude names the branch and title when you open it. An exact branch name, with no spaces, is used as typed.")
 	case rowIssue:
 		is := r.issue
 		meta := []seg{{stFaint, is.ID + "  "}, stateGlyph(is.StateType, is.StateColor), {stMuted, " " + is.State}}

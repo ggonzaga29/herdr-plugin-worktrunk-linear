@@ -17,17 +17,25 @@ func testModel() model {
 	return m
 }
 
-func TestNamingWaitsForCreate(t *testing.T) {
+func TestOpeningTheFormNames(t *testing.T) {
 	m := testModel()
-	tm, _ := m.openForm("fix the login loop", "")
-	m = tm.(model)
-	if m.form.naming || len(m.jobs) != 0 {
-		t.Fatal("opening the form must not ask Claude")
+	m.issues = sampleIssues()
+	m.refilter()
+	for range m.rows {
+		m.move(1)
 	}
-	tm, cmd := m.create()
+	if len(m.jobs) != 0 {
+		t.Fatal("moving through the menu must not ask Claude")
+	}
+	tm, cmd := m.openForm("fix the login loop", "")
 	m = tm.(model)
-	if !m.form.naming || !m.form.queued || m.action != nil || cmd == nil {
-		t.Fatalf("Create should start naming and wait: naming=%v queued=%v action=%v", m.form.naming, m.form.queued, m.action)
+	if !m.form.naming || len(m.jobs) != 1 || cmd == nil {
+		t.Fatalf("opening the form should ask Claude once: naming=%v jobs=%d", m.form.naming, len(m.jobs))
+	}
+	tm, _ = m.create()
+	m = tm.(model)
+	if !m.form.queued || m.action != nil || len(m.jobs) != 1 {
+		t.Fatalf("Create should wait for the same answer: queued=%v action=%v jobs=%d", m.form.queued, m.action, len(m.jobs))
 	}
 
 	// An answer for some other input changes nothing.
@@ -60,8 +68,8 @@ func TestTypedNamesSkipClaude(t *testing.T) {
 	m.inBranch.SetValue("fix/login-loop")
 	tm, _ = m.create()
 	m = tm.(model)
-	if m.action == nil || len(m.jobs) != 0 {
-		t.Fatal("with title and branch filled in, Create should launch without Claude")
+	if m.action == nil {
+		t.Fatal("with title and branch filled in, Create should launch without waiting for Claude")
 	}
 }
 
@@ -119,10 +127,10 @@ func TestNamingHintRenames(t *testing.T) {
 	if m.inBranch.Value() != "" || m.form.names.Branch != "" {
 		t.Fatal("a changed hint should drop the old names")
 	}
-	tm, _ = m.create()
-	m = tm.(model)
-	if !m.form.naming || m.action != nil {
-		t.Fatal("Create should ask Claude again under the new hint")
+	m.form.cursor = fBase // leaving the Naming field asks again, under the new hint
+	m.focusField()
+	if want := nameKey("/repo", "fix the login loop", "start with web-app", m.agents[0]); !m.form.naming || m.form.key != want {
+		t.Fatalf("leaving the Naming field should ask Claude again: naming=%v key=%q", m.form.naming, m.form.key)
 	}
 }
 

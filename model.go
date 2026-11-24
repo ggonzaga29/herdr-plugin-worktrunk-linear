@@ -150,7 +150,7 @@ func newModel(repo string) model {
 	field := func() textinput.Model {
 		t := textinput.New()
 		t.Prompt = ""
-		t.Placeholder = "Claude names it on Create, or type your own"
+		t.Placeholder = "Claude names it, or type your own"
 		t.PlaceholderStyle = stFaint
 		return t
 	}
@@ -433,8 +433,25 @@ func (m model) openForm(input, issueID string) (tea.Model, tea.Cmd) {
 	return m, m.focusField()
 }
 
-// focusField gives the keyboard to the text field under the cursor, if any.
+// wantNames reports whether Claude should name now: nothing asked yet, or the answer was dropped
+// for a new hint or project. Not while you are still typing the hint, and not once you have typed
+// both names yourself. One call per form, never per highlighted row in the menu (too costly).
+func (m model) wantNames() bool {
+	f := m.form
+	return !f.naming && f.names.Branch == "" && f.nameErr == "" && f.cursor != fHint &&
+		!(f.edited[fTitle] && f.edited[fBranch])
+}
+
+// focusField gives the keyboard to the text field under the cursor, if any, and has Claude name
+// the work when names are due (the form just opened, or you left a changed Naming field).
 func (m *model) focusField() tea.Cmd {
+	if m.wantNames() {
+		return tea.Batch(m.startNaming(), m.focusInput())
+	}
+	return m.focusInput()
+}
+
+func (m *model) focusInput() tea.Cmd {
 	m.inTitle.Blur()
 	m.inBranch.Blur()
 	m.inHint.Blur()
@@ -756,8 +773,8 @@ func (m model) create() (tea.Model, tea.Cmd) {
 		m.flash = "pick a project first"
 		return m, nil
 	case (title == "" || branch == "") && (f.naming || f.names.Branch == ""):
-		// Claude names only on Create (naming every highlighted row costs too much): ask,
-		// then launch from gotNames when the names arrive.
+		// Names are still coming (or were dropped for a new hint): ask if need be, then launch
+		// from gotNames when they arrive.
 		cmd := m.startNaming()
 		m.form.queued = true
 		return m, cmd

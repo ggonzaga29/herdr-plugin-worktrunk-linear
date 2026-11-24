@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
@@ -182,9 +183,9 @@ func (m model) menuPreview(w, h int) string {
 	case rowNew:
 		title = "New worktree"
 		lines = append(lines, wrap(strings.TrimSpace(m.input.Value()), inner)...)
-		lines = append(lines, "",
-			stDim.Render("Claude names the branch and title"), stDim.Render("(about 4 s). An exact branch name,"),
-			stDim.Render("with no spaces, is kept as typed."), "",
+		lines = append(lines, "")
+		lines = append(lines, m.previewNames()...)
+		lines = append(lines, "", stDim.Render("An exact branch name, with no"), stDim.Render("spaces, is kept as typed."), "",
 			stAccent.Render("Enter: the form, filled in"))
 	case rowIssue:
 		is := r.issue
@@ -193,6 +194,10 @@ func (m model) menuPreview(w, h int) string {
 		lines = append(lines, "", stDim.Render("State   ")+is.State)
 		if len(is.Labels) > 0 {
 			lines = append(lines, stDim.Render("Labels  ")+strings.Join(is.Labels, ", "))
+		}
+		if names := m.previewNames(); len(names) > 0 {
+			lines = append(lines, "")
+			lines = append(lines, names...)
 		}
 		lines = append(lines, "", stDim.Render("Branch, from Linear"))
 		d, ok := m.details[is.ID]
@@ -229,6 +234,29 @@ func (m model) menuPreview(w, h int) string {
 	return box(title, lines, w, h)
 }
 
+// previewNames shows the highlighted row's naming job: running, or its branch and title.
+func (m model) previewNames() []string {
+	in := m.highlighted()
+	if in == "" || m.repo == "" || len(m.agents) == 0 {
+		return nil
+	}
+	j, ok := m.jobs[nameKey(m.repo, in, m.agents[m.defaultAgent(m.repo)])]
+	switch {
+	case !ok:
+		return []string{stDim.Render("Claude names it when you pause here")}
+	case !j.done:
+		return []string{m.spin.View() + stAccent.Render(" naming with Claude") +
+			stDim.Render(fmt.Sprintf(" · %ds", int(time.Since(j.start).Seconds())))}
+	case j.err != nil:
+		return []string{stWarn.Render("naming failed; the form retries")}
+	}
+	out := []string{stDim.Render("Title   ") + j.names.Title}
+	if m.rows[m.cursor].kind == rowNew {
+		out = append(out, stDim.Render("Branch  ")+j.names.Branch)
+	}
+	return out
+}
+
 func (m model) viewForm() string {
 	f := m.form
 	left, right := m.columns()
@@ -239,11 +267,13 @@ func (m model) viewForm() string {
 	for i := 0; i < fieldCount; i++ {
 		var content string
 		if i == fCreate {
-			c := "▶ Create"
-			if f.naming {
-				c += stDim.Render("  waits for the names")
+			content = stBold.Render("▶ Create")
+			switch {
+			case f.queued:
+				content += "  " + m.spin.View() + stAccent.Render(" starting as soon as the names arrive") + stDim.Render(" · esc cancels")
+			case f.naming:
+				content += stDim.Render("  enter now: starts when the names arrive")
 			}
-			content = stBold.Render(c)
 		} else {
 			label := fit(labels[i], 9)
 			value, badge := m.fieldValue(i)
@@ -280,7 +310,8 @@ func (m model) viewForm() string {
 // fieldValue returns a field's shown value and its badge.
 func (m model) fieldValue(i int) (string, string) {
 	f := m.form
-	naming := m.spin.View() + stAccent.Render(" naming with Claude…")
+	naming := m.spin.View() + stAccent.Render(" naming with Claude") +
+		stDim.Render(fmt.Sprintf(" · %ds", int(m.nameWait().Seconds())))
 	switch i {
 	case fTitle:
 		if f.naming && !f.edited[fTitle] && f.issueID == "" {

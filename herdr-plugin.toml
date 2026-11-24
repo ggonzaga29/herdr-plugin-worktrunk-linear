@@ -1,6 +1,6 @@
 id = "ggonzaga29.worktrunk-linear"
 name = "Worktrunk + Linear"
-version = "0.2.2"
+version = "0.2.3"
 min_herdr_version = "0.9.5"
 description = "One menu: start work in a worktrunk worktree from a Linear issue or a typed task (Claude names it), or clean up idle worktrees"
 platforms = ["macos", "linux"]

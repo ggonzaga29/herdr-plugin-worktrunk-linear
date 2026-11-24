@@ -1,5 +1,5 @@
-# version 0.2.2
-1b20e9bfc852962e0020b188298f22e8c5aae373be02a2959b0d55d92ccd0c0d  herdr-wtl-darwin-amd64
-161bf1ee616afa0eafb7f60ffaecad529c525065c3f1fd6e16cc0af9fbff20f4  herdr-wtl-darwin-arm64
-5904c07a1fc38e5ccbdef5a0e9b7510e8e3fad8eee579db4d5d190614ab96def  herdr-wtl-linux-amd64
-8e306430198c2429000de462efba4cc443898f7b769dc282dba1b78c57c2582e  herdr-wtl-linux-arm64
+# version 0.2.3
+508c8482bd3835d03094a1a7708e56d427f0f6bcf4f051c4a0422f7adc6e2359  herdr-wtl-darwin-amd64
+9bf40daed11299fe5980e683892469a0b2b4eb544ca49e254184bb57d409295d  herdr-wtl-darwin-arm64
+8a7793e95b0ba5e36f475a0e35f3205240126ce4d119b4388e3bcbf53bd44570  herdr-wtl-linux-amd64
+3f84c6bb1c3190e2dbc7fbee0deedd2282a509dbdbc2f1efa19808952f2af165  herdr-wtl-linux-arm64

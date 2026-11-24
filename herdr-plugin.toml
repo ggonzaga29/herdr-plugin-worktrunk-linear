@@ -1,0 +1,31 @@
+id = "ggonzaga29.worktrunk-linear"
+name = "Worktrunk + Linear"
+version = "0.1.0"
+min_herdr_version = "0.9.5"
+description = "One menu: start work in a worktrunk worktree from a Linear issue or a typed task (Claude names it), or clean up idle worktrees"
+platforms = ["macos"]
+
+# Builds build/herdr-wtl (needs Go). `herdr plugin link` skips this: run `go build -o build/herdr-wtl .` yourself.
+[[build]]
+command = ["go", "build", "-o", "build/herdr-wtl", "."]
+
+# Bind a key in ~/.config/herdr/config.toml:
+#   [[keys.command]]
+#   key = "prefix+shift+n"
+#   type = "plugin_action"
+#   command = "ggonzaga29.worktrunk-linear.menu"
+#   description = "worktrees: new or clean"
+[[actions]]
+id = "menu"
+title = "Worktrees: new or clean"
+contexts = ["global", "workspace", "pane"]
+command = ["sh", "-c", "exec \"$HERDR_BIN_PATH\" plugin pane open --plugin ggonzaga29.worktrunk-linear --entrypoint menu"]
+
+# Plugin panes start in the workspace's folder, so the binary is found through HERDR_PLUGIN_ROOT.
+[[panes]]
+id = "menu"
+title = "Worktrees"
+placement = "popup"
+width = "85%"
+height = "75%"
+command = ["sh", "-c", "exec \"$HERDR_PLUGIN_ROOT/build/herdr-wtl\""]

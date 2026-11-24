@@ -1,0 +1,448 @@
+#!/usr/bin/env bash
+# herdr-start — start work in a worktrunk worktree, opened as a herdr workspace with an agent on it.
+set -euo pipefail
+
+usage() {
+  cat <<'USAGE'
+herdr-start — start work in a worktrunk worktree, opened as a herdr workspace with an agent on it.
+
+Usage:
+  herdr-start [options]                         picker: your Linear issues, or type a task or branch name
+  herdr-start [options] ENG-123 [prompt...]     Linear ticket (ID, lowercase ID, or linear.app URL)
+  herdr-start [options] "a task" [prompt...]    free text: Claude names the branch and title
+  herdr-start [options] BRANCH [prompt...]      an exact branch name (no spaces): create or switch to it
+  herdr-start --names INPUT                     print the resolved branch, title and prompt as JSON
+
+Names:
+  ticket   branch = Linear's own branch name (or -B); title = "ENG-123 " + Claude's short version
+           of the ticket title; prompt = ID + title + how to read it, then [prompt...].
+  task     branch and title from Claude (Haiku, ~4 s), in the style of the repo's recent branches;
+           no answer within 15 s → a plain slug. prompt = [prompt...], or the task itself.
+  branch   used as is; title = branch; prompt = [prompt...].
+  A prefix for Claude-named branches: $HERDR_START_BRANCH_PREFIX or `git config herdr-start.branchPrefix`.
+  A Claude-named branch that already exists gets -2, -3, ...; set HERDR_START_NO_CLAUDE=1 to skip Claude.
+
+The branch is switched to if it exists locally or on the remote (fetched if needed), and created
+from the base otherwise. If the worktree is already open in herdr, its agent is focused (and the
+prompt typed if it is idle); if it has no agent, one is started in a new split.
+
+Options (anywhere on the line; `--` ends options):
+  -a, --account NAME  Claude account: "personal" (default) runs `claude`, any other name runs the
+                      wrapper `claude-NAME` (e.g. -a team). Also the account Claude names things with.
+  -k, --kind CMD      agent command instead of claude (codex, gemini, opencode, ...); -k claude keeps -a
+  -B, --branch NAME   use this branch name (forces branch mode, or overrides a ticket's branch)
+  -b, --base REF      base for a new branch (default: worktrunk's default branch)
+      --title TEXT    herdr workspace title (skips Claude's title)
+      --prompt TEXT   the whole prompt, replacing the one built from the ticket or task
+  -s, --submit        submit the prompt; default only types it into the agent's input
+  -d, --detach        once the agent is launched, finish (startup questions, rename, prompt) in the
+                      background and exit; problems arrive as herdr notifications, log in
+                      ~/.cache/herdr-start.log. Used by the herdr menu popup.
+      --names         resolve INPUT and print JSON (kind, id, branch, title, prompt, sources, where)
+  -n, --dry-run       resolve everything and print the plan, change nothing
+  -h, --help          show this help
+
+Examples:
+  herdr-start ENG-2922
+  herdr-start ENG-2922 -a team "start with the sign-in screen"
+  herdr-start "users get stuck in a redirect loop after login"
+  herdr-start -b develop feat/price-chart
+  herdr-start --names "users get stuck in a redirect loop"
+
+Run it from inside the repo (any worktree or subdirectory). If the agent asks startup questions
+(Claude's "trust this folder?" for a new worktree), answer them in the pane; herdr-start waits up
+to 5 minutes, then types the prompt. If anything fails after the agent starts, the prompt is
+printed (or notified) so you can paste it.
+
+When work is done: `herdr-clean` removes idle worktrees and their leftover caches (see herdr-clean -h).
+USAGE
+}
+
+detach=false
+# In a popup, output vanishes when the popup closes: hold it open on errors so they can be read.
+die() {
+  printf 'herdr-start: %s\n' "$*" >&2
+  if $detach && [[ -t 0 ]]; then read -r -p "[Enter to close]" _ || true; fi
+  exit 1
+}
+note() { printf 'herdr-start: %s\n' "$*" >&2; }
+
+# ---------- options (accepted anywhere; bash 3.2 safe) ----------
+herdr=${HERDR_BIN_PATH:-herdr}
+wt=${WORKTRUNK_BIN:-wt}
+account=personal kind='' base='' branch_opt='' title_opt='' prompt_opt='' prompt_set=false
+submit=false dry=false names_only=false
+pos=()
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    --*=*) set -- "${1%%=*}" "${1#*=}" "${@:2}"; continue ;;
+    -h|--help) usage; exit 0 ;;
+    -a|--account|-k|--kind|-b|--base|-B|--branch|--title)
+      [[ $# -ge 2 && -n $2 ]] || die "$1 needs a value (see --help)"
+      case $1 in
+        -a|--account) account=$2 ;;
+        -k|--kind) kind=$2 ;;
+        -b|--base) base=$2 ;;
+        -B|--branch) branch_opt=$2 ;;
+        --title) title_opt=$2 ;;
+      esac
+      shift 2 ;;
+    --prompt)  # may be empty on purpose: no prompt at all
+      [[ $# -ge 2 ]] || die "--prompt needs a value (see --help)"
+      prompt_opt=$2 prompt_set=true
+      shift 2 ;;
+    -s|--submit) submit=true; shift ;;
+    -n|--dry-run) dry=true; shift ;;
+    -d|--detach) detach=true; shift ;;
+    --names) names_only=true; shift ;;
+    --) shift; pos+=("$@"); break ;;
+    -?*) die "unknown option: $1 (see --help)" ;;
+    *) pos+=("$1"); shift ;;
+  esac
+done
+set -- ${pos[@]+"${pos[@]}"}
+
+# ---------- preflight ----------
+for dep in git jq "$wt" "$herdr"; do
+  command -v "$dep" >/dev/null || die "required command not found: $dep"
+done
+git rev-parse --show-toplevel >/dev/null 2>&1 || die "not inside a git repository"
+
+# Launcher = what gets typed into the new pane's shell. Accounts are wrapper scripts (claude-team
+# sets CLAUDE_CONFIG_DIR and syncs memory), so a new account is just a new claude-<name> on PATH.
+[[ $account =~ ^[A-Za-z0-9._-]+$ ]] || die "invalid account name: $account"
+[[ -z $kind || $kind =~ ^[A-Za-z0-9._-]+$ ]] || die "invalid agent command: $kind"
+if [[ -n $kind && $kind != claude ]]; then
+  [[ $account == personal ]] || note "ignoring -a $account: accounts only apply to claude"
+  launcher=$kind
+elif [[ $account == personal ]]; then
+  launcher=claude
+else
+  launcher=claude-$account
+fi
+command -v "$launcher" >/dev/null || die "agent command not found on PATH: $launcher"
+
+tmp=$(mktemp)
+trap 'rm -f "$tmp"' EXIT
+
+# ---------- Claude naming ----------
+# One structured Haiku call. Prints the structured JSON, or fails (no claude, error, timeout, junk).
+ask_claude() {  # $1 = JSON schema, $2 = prompt
+  [[ ${HERDR_START_NO_CLAUDE:-} == 1 ]] && return 1
+  local cli out pid watcher rc
+  # Name on the chosen Claude account; other agent kinds fall back to plain claude.
+  if [[ $launcher == claude || $launcher == claude-* ]]; then cli=$launcher; else cli=claude; fi
+  command -v "$cli" >/dev/null || return 1
+  out=$(mktemp)
+  MAX_THINKING_TOKENS=0 "$cli" -p --no-session-persistence --model haiku --tools '' --safe-mode \
+    --setting-sources user --output-format json --json-schema "$1" "$2" </dev/null >"$out" 2>/dev/null &
+  pid=$!
+  # The watcher must not hold our stdout open, or callers reading it wait out the sleep.
+  ( sleep "${HERDR_START_NAMING_TIMEOUT:-15}"; kill "$pid" 2>/dev/null ) </dev/null >/dev/null 2>&1 &
+  watcher=$!
+  if wait "$pid" 2>/dev/null; then
+    kill "$watcher" 2>/dev/null || true
+    jq -ce '.structured_output // empty' "$out" 2>/dev/null
+    rc=$?
+  else
+    kill "$watcher" 2>/dev/null || true
+    rc=1
+  fi
+  rm -f "$out"
+  return $rc
+}
+
+branch_prefix() { printf '%s' "${HERDR_START_BRANCH_PREFIX:-$(git config --get herdr-start.branchPrefix 2>/dev/null || true)}"; }
+
+slugify() {  # text → lowercase-hyphen slug, at most 50 chars
+  printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g; s/^-+//' | cut -c1-50 | sed -E 's/-+$//'
+}
+
+clean_branch() {  # Claude's answer → a safe branch name, or nothing
+  local b
+  b=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | tr ' ' '-' | sed -E 's#[^a-z0-9/._-]+#-#g; s#-+#-#g; s#^[-/.]+##; s#[-/.]+$##' | cut -c1-60 | sed -E 's#[-/.]+$##')
+  git check-ref-format --branch "$b" >/dev/null 2>&1 && printf '%s' "$b"
+}
+
+branch_exists() { git show-ref --verify --quiet "refs/heads/$1" || [[ -n $(git for-each-ref --count=1 "refs/remotes/*/$1") ]]; }
+
+dedupe() {  # a NEW name must not collide with an existing branch: name, name-2, name-3, ...
+  local b=$1 n=2
+  while branch_exists "$b" && [[ $n -lt 10 ]]; do b="$1-$n"; n=$((n + 1)); done
+  printf '%s' "$b"
+}
+
+name_task() {  # $1 = task text → sets branch, title, branch_src, title_src
+  local prefix recent schema ask json b='' t=''
+  prefix=$(branch_prefix)
+  recent=$(git for-each-ref --count=20 --sort=-committerdate --format='%(refname:short)' refs/heads | tr '\n' ' ')
+  schema='{"type":"object","properties":{"branch":{"type":"string"},"title":{"type":"string"}},"required":["branch","title"],"additionalProperties":false}'
+  ask="Name a git branch and a short workspace title for the task below.
+Branch: lowercase words joined by hyphens, at most 50 characters. Follow the naming style of this repo's recent branches (prefixes such as feat/ or fix/ only if they use them)${prefix:+; it must start with $prefix}. Recent branches: ${recent:-none}
+Title: at most 40 characters, sentence case, no trailing period.
+Task: $1"
+  if json=$(ask_claude "$schema" "$ask"); then
+    b=$(clean_branch "$(jq -r '.branch // ""' <<<"$json")")
+    t=$(jq -r '.title // ""' <<<"$json" | tr '\n' ' ' | sed 's/ *$//' | cut -c1-60)
+  fi
+  if [[ -n $b ]]; then
+    [[ -z $prefix || $b == "$prefix"* ]] || b=$prefix$b
+    branch_src=claude
+  else
+    b=$prefix$(slugify "$1")
+    branch_src=fallback
+  fi
+  [[ -n ${b#"$prefix"} ]] || die "cannot make a branch name from: $1"
+  branch=$(dedupe "$b")
+  if [[ -n ${t// /} ]]; then title=$t title_src=claude; else title=${1:0:60} title_src=fallback; fi
+}
+
+short_title() {  # $1 = ticket title → Claude's short version, or fails
+  local schema json t
+  schema='{"type":"object","properties":{"title":{"type":"string"}},"required":["title"],"additionalProperties":false}'
+  json=$(ask_claude "$schema" "Shorten this issue title to at most 40 characters for a terminal tab title. Keep the key nouns, drop bracketed tags and filler words, sentence case, no trailing period. Title: $1") || return 1
+  t=$(jq -r '.title // ""' <<<"$json" | tr '\n' ' ' | sed 's/ *$//' | cut -c1-50)
+  [[ -n ${t// /} ]] && printf '%s' "$t"
+}
+
+# ---------- input: ticket, task, branch, or picker ----------
+input=''
+if [[ $# -gt 0 ]]; then
+  # With -B, the first word is a ticket only if it looks like one; otherwise every word is prompt.
+  if [[ -z $branch_opt || $1 =~ ^[A-Za-z]+-[0-9]+$ || $1 == *linear.app/*/issue/* ]]; then
+    input=$1
+    shift
+  fi
+fi
+extra=$*
+
+if [[ -z $input && -z $branch_opt ]]; then
+  $names_only && die "--names needs an INPUT"
+  [[ -t 0 && -t 2 ]] || die "no ticket or branch given, and no terminal for the picker"
+  command -v fzf >/dev/null || die "fzf not found; pass a ticket ID or branch name"
+  # Linear's team comes from the repo's .linear.toml; repos without one get no tickets, only branch input.
+  issues=''
+  command -v linear >/dev/null &&
+    issues=$(NO_COLOR=1 linear issue mine --state started --state unstarted --limit 100 --no-pager 2>/dev/null |
+      grep -E '[A-Z]+-[0-9]+' || true)
+  header='Enter: pick ticket · no match: typed text becomes a task (Claude names it) or an exact branch'
+  [[ -z $issues ]] && header='No Linear issues for this repo (no .linear.toml? run `linear config`) · type a task or branch name'
+  picked=$(fzf --print-query --prompt 'ticket, task or branch> ' --header "$header" <<<"$issues" || true)
+  query=$(sed -n 1p <<<"$picked")
+  match=$(sed -n 2p <<<"$picked")
+  input=$(grep -oE '[A-Z]+-[0-9]+' <<<"$match" | head -1 || true)
+  input=${input:-$query}
+fi
+input=${input#"${input%%[![:space:]]*}"}; input=${input%"${input##*[![:space:]]}"}  # trim
+[[ -n $input || -n $branch_opt ]] || die "nothing picked"
+
+# Ticket if it looks like one. Uppercase IDs and URLs must resolve in Linear (a typo should not
+# become a junk branch); lowercase look-alikes such as fix-123 fall back to being a branch name.
+id='' ticket_title='' branch='' title='' kindof=branch branch_src=typed title_src=typed
+candidate=''
+if [[ $input =~ ^[A-Za-z]+-[0-9]+$ ]]; then
+  candidate=$input
+elif [[ $input =~ linear\.app/[^/]+/issue/([A-Za-z]+-[0-9]+) ]]; then
+  candidate=${BASH_REMATCH[1]}
+fi
+if [[ -n $candidate ]]; then
+  strict=false
+  [[ $candidate =~ ^[A-Z]+-[0-9]+$ || $input == *linear.app* ]] && strict=true
+  if command -v linear >/dev/null &&
+     issue=$(linear issue view "$candidate" --json --no-comments 2>"$tmp") &&
+     id=$(jq -er '.identifier // empty' <<<"$issue" 2>/dev/null); then
+    kindof=ticket
+    ticket_title=$(jq -r '.title // ""' <<<"$issue")
+    branch=$(jq -r '.branchName // empty' <<<"$issue")
+    branch_src=linear
+    [[ -n $branch ]] || branch=$(tr '[:upper:]' '[:lower:]' <<<"$id")
+  elif $strict; then
+    reason=$(head -1 "$tmp" 2>/dev/null || true)
+    command -v linear >/dev/null || reason="linear CLI not installed"
+    die "$candidate not found in Linear${reason:+ ($reason)}. Wrong workspace? run \`linear config\` in this repo, or pass -B NAME to use a branch name"
+  else
+    note "$candidate is not a Linear issue; using it as a branch name"
+  fi
+fi
+
+if [[ $kindof != ticket ]]; then
+  if [[ -n $branch_opt ]]; then
+    branch=$branch_opt
+    [[ -n $input ]] && kindof=task || kindof=branch
+  elif [[ $input != *[[:space:]]* ]] && git check-ref-format --branch "$input" >/dev/null 2>&1; then
+    branch=$input
+  else
+    kindof=task
+    name_task "$input"  # with --title, only its branch is used
+  fi
+fi
+if [[ -n $branch_opt ]]; then branch=$branch_opt branch_src=typed; fi
+git check-ref-format --branch "$branch" >/dev/null 2>&1 || die "invalid branch name: $branch"
+
+# Title (herdr workspace label) and prompt.
+case $kindof in
+  ticket)
+    if [[ -n $title_opt ]]; then title=$title_opt title_src=typed
+    elif short=$(short_title "$ticket_title"); then title="$id $short" title_src=claude
+    else title="$id ${ticket_title:0:60}" title_src=fallback
+    fi
+    # ponytail: title + ID only; the agent reads the full ticket itself, so ticket text never lands in the input unseen.
+    prompt="Work on Linear $id: $ticket_title. Read it first with \`linear issue view $id\`.${extra:+ $extra}" ;;
+  task)
+    [[ -n $title_opt ]] && { title=$title_opt; title_src=typed; }
+    [[ -n $title ]] || { title=${input:0:60}; title_src=typed; }
+    prompt=${extra:-$input} ;;
+  *)
+    title=${title_opt:-${branch:0:70}}
+    prompt=$extra ;;
+esac
+$prompt_set && prompt=$prompt_opt
+# Newlines would submit a typed prompt early in most agent TUIs.
+prompt=${prompt//$'\n'/ }
+label=$title
+
+# herdr agent names: lowercase start, [a-z0-9_-], 1-32 chars (ENG-2922 → eng-2922, feat/x → feat-x).
+name=$(printf '%s' "${id:-$branch}" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9_-' '-')
+[[ $name =~ ^[a-z] ]] || name=a-$name
+name=${name:0:32}
+
+# ---------- branch: exists locally, on the remote, or new ----------
+main_wt=$(git worktree list --porcelain | sed -n '1s/^worktree //p')
+main_branch=$(git -C "$main_wt" symbolic-ref --quiet --short HEAD 2>/dev/null || true)
+remote=$(git remote | grep -qx origin && echo origin || git remote | head -1)
+
+if $names_only; then
+  # Fast: no network. The real run checks the remote again.
+  where=new
+  if git show-ref --verify --quiet "refs/heads/$branch"; then where=local
+  elif [[ -n $remote ]] && git show-ref --verify --quiet "refs/remotes/$remote/$branch"; then where=remote
+  fi
+  [[ $branch == "$main_branch" ]] && where=main
+  jq -n --arg kind "$kindof" --arg id "$id" --arg branch "$branch" --arg title "$title" --arg prompt "$prompt" \
+    --arg branch_source "$branch_src" --arg title_source "$title_src" --arg where "$where" \
+    '{kind:$kind, id:$id, branch:$branch, title:$title, prompt:$prompt, branch_source:$branch_source, title_source:$title_source, where:$where}'
+  exit 0
+fi
+
+[[ $branch == "$main_branch" ]] &&
+  die "$branch is checked out in the main checkout ($main_wt); herdr-start opens linked worktrees, pick another branch"
+
+where=new
+if git show-ref --verify --quiet "refs/heads/$branch"; then
+  where=local
+elif [[ -n $remote ]] && git show-ref --verify --quiet "refs/remotes/$remote/$branch"; then
+  where=remote
+elif [[ -n $remote ]] && GIT_TERMINAL_PROMPT=0 git ls-remote --exit-code --heads "$remote" "$branch" >/dev/null 2>&1; then
+  where=remote-unfetched
+fi
+create=()
+if [[ $where == new ]]; then
+  create=(--create)
+  [[ -n $base ]] && create+=(--base "$base")
+elif [[ -n $base ]]; then
+  note "ignoring -b $base: $branch already exists ($where)"
+fi
+
+if $dry; then
+  printf 'ticket : %s\nbranch : %s (%s, %s)\ntitle  : %s (%s)\nwt     : wt switch %s %s --no-cd\nagent  : %s (name %s)\nprompt : %s (%s)\n' \
+    "${id:-none}" "$branch" "$where" "$branch_src" "$label" "$title_src" "${create[*]-}" "$branch" "$launcher" "$name" \
+    "${prompt:-none}" "$($submit && echo submit || echo type-only)"
+  exit 0
+fi
+
+# Ask herdr for the repo root before touching anything, so a stopped herdr server fails cleanly.
+repo_root=$("$herdr" worktree list --cwd "$PWD" 2>/dev/null | jq -r '.result.source.repo_root // empty' || true)
+[[ -n $repo_root ]] || die "herdr did not answer (is the server running? try \`herdr status\`)"
+
+if [[ $where == remote-unfetched ]]; then
+  GIT_TERMINAL_PROMPT=0 git fetch --quiet "$remote" "refs/heads/$branch:refs/remotes/$remote/$branch" ||
+    die "could not fetch $branch from $remote"
+fi
+
+# ---------- worktree ----------
+# --no-cd because a script can't cd its parent shell. Worktrunk hooks (and their approval prompts) still run.
+out=$("$wt" switch ${create[@]+"${create[@]}"} "$branch" --no-cd --format json) || die "worktrunk failed (see above)"
+path=$(jq -r '.path // empty' <<<"$out" 2>/dev/null || true)
+[[ -d $path ]] || die "worktrunk did not report a worktree path (output: $out)"
+
+# ---------- herdr workspace ----------
+# Register under the repo's root workspace (herdr rejects a linked worktree's own workspace, and an
+# outside-herdr shell has none); herdr reuses or creates that root workspace.
+opened=$("$herdr" worktree open --cwd "$repo_root" --path "$path" --label "$label" --focus 2>&1) ||
+  die "herdr could not open the worktree: $opened (worktree is at $path; rerun herdr-start to retry)"
+ws=$(jq -r .result.workspace.workspace_id <<<"$opened")
+pane=$(jq -r .result.root_pane.pane_id <<<"$opened")
+
+log=${XDG_CACHE_HOME:-$HOME/.cache}/herdr-start.log
+give_up() {
+  note "$1"
+  [[ -n $prompt ]] && printf 'herdr-start: prompt, to paste yourself:\n%s\n' "$prompt" >&2
+  if $detach; then
+    "$herdr" notification show "herdr-start: $label" --body "$1. Prompt saved in $log" --sound request >/dev/null 2>&1 || true
+  fi
+  exit 1
+}
+
+type_prompt() {  # $1 = pane, $2 = text to put before a typed prompt
+  [[ -n $prompt ]] || return 0
+  if $submit; then
+    "$herdr" agent prompt "$1" "$prompt" >/dev/null 2>&1 || give_up "agent did not accept the prompt"
+  else
+    "$herdr" pane send-text "$1" "${2:-}$prompt" >/dev/null 2>&1 || give_up "could not type the prompt"
+  fi
+}
+
+if [[ $(jq -r .result.already_open <<<"$opened") == true ]]; then
+  existing=$("$herdr" agent list | jq -r --arg ws "$ws" \
+    '[.result.agents[] | select(.workspace_id == $ws and .agent != null)][0] // empty | "\(.pane_id) \(.agent_status)"')
+  if [[ -n $existing ]]; then
+    read -r agent_pane agent_status <<<"$existing"
+    "$herdr" agent focus "$agent_pane" >/dev/null 2>&1 || true
+    if [[ -z $prompt ]]; then
+      echo "herdr-start: $label was already open; focused its agent"
+    elif [[ $agent_status == idle || $agent_status == done ]]; then
+      type_prompt "$agent_pane" ' '  # an existing agent may hold a draft: append, never clear it
+      echo "herdr-start: $label was already open; focused its agent and typed the prompt"
+    else
+      give_up "$label was already open and its agent is $agent_status; not typing into it"
+    fi
+    exit 0
+  fi
+  # Open but agent-less: never type into a pane that may be running something; use a new split.
+  split=$("$herdr" pane split "$pane" --direction right --cwd "$path" --focus 2>&1) ||
+    die "could not split a pane for the agent: $split"
+  pane=$(jq -r .result.pane.pane_id <<<"$split")
+  note "$label was already open without an agent; starting one in a new split"
+fi
+
+# ---------- agent ----------
+# Type the launcher into the pane's shell (works for wrappers, unlike `herdr agent start --kind`).
+"$herdr" pane run "$pane" "$launcher" >/dev/null || give_up "could not run $launcher in pane $pane"
+
+finish() {  # wait for the agent, answer nothing for you, rename it, type the prompt
+  local tries=0 state
+  # `agent wait` errors at once until herdr has detected the agent, so retry for up to 60s.
+  until state=$("$herdr" agent wait "$pane" --until idle --until blocked --timeout 60000 2>/dev/null); do
+    (( ++tries < 60 )) || give_up "no agent detected in pane $pane after 60s; check the pane for errors"
+    sleep 1
+  done
+  if [[ $(jq -r '.result.agent.agent_status // empty' <<<"$state" 2>/dev/null || true) == blocked ]]; then
+    # A new worktree is a new folder to Claude, so it asks whether to trust it (and maybe more). Those answers are yours.
+    note "agent is asking something at startup (folder trust?); answer it in the pane — waiting up to 5 min"
+    "$herdr" agent wait "$pane" --until idle --timeout 300000 >/dev/null 2>&1 ||
+      give_up "agent exited or did not become ready within 5 min"
+  fi
+  "$herdr" agent rename "$pane" "$name" >/dev/null 2>&1 || note "could not rename agent to $name (kept default name)"
+  type_prompt "$pane"
+  echo "herdr-start: $label ($launcher) → $path"
+}
+
+if $detach; then
+  # The popup closes now; the rest runs on, immune to the popup's hangup, writing to the log.
+  mkdir -p "$(dirname "$log")"
+  ( trap '' HUP; echo "--- $(date '+%F %T') $label"; finish ) </dev/null >>"$log" 2>&1 &
+  disown 2>/dev/null || true
+  echo "herdr-start: $label ($launcher) → $path; finishing in the background"
+  exit 0
+fi
+finish

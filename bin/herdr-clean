@@ -1,0 +1,233 @@
+#!/usr/bin/env bash
+# herdr-clean — remove idle worktrees and the storage they leave behind.
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+herdr-clean — remove idle worktrees and the storage they leave behind.
+
+Usage:
+  herdr-clean [options] [REPO...]     REPO defaults to the repo you are in (any worktree of it)
+
+For each repo it plans:
+  remove   linked worktrees that are idle: no herdr agent and no non-shell process running in
+           them, and no uncommitted changes. Removed with `wt remove` (worktrunk hooks run), which
+           deletes the branch only if it is merged; unmerged branches are kept with their commits.
+           An open herdr workspace for the worktree is closed first.
+  skip     worktrees in use (agent, dev server, editor...), with uncommitted changes, or holding
+           your current directory. They are listed with the reason and never touched.
+  prune    git's records of worktrees whose folder is already gone (`git worktree prune`).
+  rmdir    empty leftover folders next to the repo (REPO.something) that are not worktrees.
+  review   non-empty leftover folders that are not worktrees: listed only, never deleted.
+And once, across repos:
+  xcode    Xcode DerivedData whose project path no longer exists (pure build cache; rebuilt on demand),
+           including the caches of worktrees removed in this run.
+  pnpm     with --pnpm: `pnpm store prune` (drops store packages no project references).
+
+Shows the plan with sizes, then asks before changing anything.
+
+Options:
+  -n, --dry-run   show the plan only
+  -y, --yes       do not ask for confirmation
+      --no-xcode  skip the Xcode DerivedData step
+      --pnpm      also prune the pnpm store
+  -h, --help      show this help
+
+Examples:
+  herdr-clean -n                 see what would go in this repo
+  herdr-clean                    plan, confirm, clean this repo
+  herdr-clean ~/workspace/guardis-frontend ~/workspace/guardis-ios --pnpm
+EOF
+}
+
+die() { printf 'herdr-clean: %s\n' "$*" >&2; exit 1; }
+note() { printf 'herdr-clean: %s\n' "$*" >&2; }
+
+dry=false yes=false xcode=true pnpm=false
+repos=()
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    -h|--help) usage; exit 0 ;;
+    -n|--dry-run) dry=true; shift ;;
+    -y|--yes) yes=true; shift ;;
+    --no-xcode) xcode=false; shift ;;
+    --pnpm) pnpm=true; shift ;;
+    --) shift; repos+=("$@"); break ;;
+    -?*) die "unknown option: $1 (see --help)" ;;
+    *) repos+=("$1"); shift ;;
+  esac
+done
+[[ ${#repos[@]} -gt 0 ]] || repos=("$PWD")
+
+wt=${WORKTRUNK_BIN:-wt}
+herdr=${HERDR_BIN_PATH:-herdr}
+for dep in git jq "$wt"; do command -v "$dep" >/dev/null || die "required command not found: $dep"; done
+have_herdr=false
+command -v "$herdr" >/dev/null && "$herdr" status server >/dev/null 2>&1 && have_herdr=true
+
+human() { awk -v k="$1" 'BEGIN { split("K M G T", u); i = 1; while (k >= 1024 && i < 4) { k /= 1024; i++ } printf (i == 1 ? "%d%s" : "%.1f%s"), k, u[i] }'; }
+size_k() { du -sk "$1" 2>/dev/null | cut -f1 || echo 0; }
+real() { (cd "$1" 2>/dev/null && pwd -P) || printf '%s' "$1"; }
+here=$(pwd -P)
+
+# Processes and their working directories, once: "pid<TAB>command<TAB>cwd". Shells are idle by
+# nature (an open herdr pane is a shell), so they do not count as "in use"; lsof and this script don't either.
+procs=$(lsof -a -d cwd -F pcn 2>/dev/null | awk -v self=$$ '
+  /^p/ { pid = substr($0, 2) } /^c/ { cmd = substr($0, 2) }
+  /^n/ { if (pid != self && cmd !~ /^-?(zsh|bash|fish|sh|dash|nu|tcsh|login|lsof)$/) print pid "\t" cmd "\t" substr($0, 2) }' || true)
+users_of() {  # $1 = real path → "cmd(pid) ..." of processes inside it
+  awk -F'\t' -v p="$1" '$3 == p || index($3, p "/") == 1 { printf "%s(%s) ", $2, $1 }' <<<"$procs"
+}
+
+# Plan rows: "action<TAB>repo<TAB>path<TAB>kb<TAB>detail<TAB>herdr workspace"
+plan=''
+add() { plan+=$(printf '%s\t%s\t%s\t%s\t%s\t%s' "$@")$'\n'; }
+removed_paths=''
+
+for repo in "${repos[@]}"; do
+  [[ -d $repo ]] || { note "not a directory: $repo"; continue; }
+  main=$(git -C "$repo" worktree list --porcelain 2>/dev/null | sed -n '1s/^worktree //p')
+  [[ -n $main ]] || { note "not a git repository: $repo"; continue; }
+  name=$(basename "$main")
+
+  # Which worktrees herdr has open, and which have an agent: "path<TAB>workspace" / agent cwds.
+  open_ws='' agent_cwds=''
+  if $have_herdr; then
+    open_ws=$("$herdr" worktree list --cwd "$main" 2>/dev/null |
+      jq -r '.result.worktrees[]? | select(.open_workspace_id != null) | "\(.path)\t\(.open_workspace_id)"' || true)
+    agent_cwds=$("$herdr" agent list 2>/dev/null | jq -r '.result.agents[]? | select(.agent != null) | .cwd // empty' || true)
+  fi
+
+  # Stale records: folders already gone. One row per repo.
+  stale=$(git -C "$main" worktree prune --dry-run --verbose 2>&1 | grep -c '^Removing' || true)  # git prints this on stderr
+  [[ $stale -gt 0 ]] && add prune "$name" "$main" 0 "$stale stale worktree record(s) whose folder is already gone" ""
+
+  registered=$("$wt" -C "$main" list --format json 2>/dev/null | jq -c '.[]?' || true)
+  [[ -n $registered ]] || { note "worktrunk could not list $main"; continue; }
+  while IFS= read -r w; do
+    [[ -n $w ]] || continue
+    path=$(jq -r .path <<<"$w")
+    [[ $(jq -r '.is_main // false' <<<"$w") == true ]] && continue
+    [[ $(jq -r '.worktree.state // ""' <<<"$w") == prunable ]] && continue   # handled by prune
+    [[ -d $path ]] || continue
+    rp=$(real "$path")
+    branch=$(jq -r '.branch // "(detached)"' <<<"$w")
+    ws=$(awk -F'\t' -v p="$path" '$1 == p { print $2; exit }' <<<"$open_ws")
+    kb=$(size_k "$path")
+
+    if [[ $here == "$rp" || $here == "$rp"/* ]]; then
+      add skip "$name" "$path" "$kb" "$branch: you are in it" ""; continue
+    fi
+    agent=$(awk -v p="$rp" -v q="$path" '$0 == p || $0 == q || index($0, p "/") == 1 || index($0, q "/") == 1 { print; exit }' <<<"$agent_cwds")
+    if [[ -n $agent ]]; then
+      add skip "$name" "$path" "$kb" "$branch: herdr agent running" ""; continue
+    fi
+    busy=$(users_of "$rp")
+    if [[ -n $busy ]]; then
+      add skip "$name" "$path" "$kb" "$branch: in use by ${busy% }" ""; continue
+    fi
+    if [[ $(jq -r '[.working_tree.staged, .working_tree.modified, .working_tree.untracked] | any' <<<"$w") == true ]]; then
+      add skip "$name" "$path" "$kb" "$branch: uncommitted changes" ""; continue
+    fi
+    # worktrunk's "nothing to merge" states: no commits (empty), same commit as main, or content already in main.
+    state=$(jq -r '.main_state // ""' <<<"$w")
+    if [[ $branch == "(detached)" ]]; then
+      detail="detached checkout"
+    elif [[ $state == integrated || $state == empty || $state == same_commit ]]; then
+      detail="$branch: nothing unmerged, branch deleted too"
+    else
+      detail="$branch: branch kept ($(jq -r '.main.ahead // "?"' <<<"$w") commits not in main)"
+    fi
+    add remove "$name" "$path" "$kb" "$detail" "$ws"
+    removed_paths+="$path"$'\n'
+  done <<<"$registered"
+
+  # Leftover folders next to the repo (worktrunk's default layout) that git no longer knows.
+  known=$(git -C "$main" worktree list --porcelain | sed -n 's/^worktree //p')
+  for d in "$main".*; do
+    [[ -d $d ]] || continue
+    grep -qxF "$d" <<<"$known" && continue
+    # "Empty" = no files at all, only (nested) directories and Finder's .DS_Store.
+    if [[ -z $(find "$d" ! -type d ! -name .DS_Store -print -quit 2>/dev/null) ]]; then
+      add rmdir "$name" "$d" 0 "empty folder tree, no files" ""
+    else
+      add review "$name" "$d" "$(size_k "$d")" "not a worktree; check and delete by hand if unwanted" ""
+    fi
+  done
+done
+
+# Xcode build caches whose project is gone (or is going in this run).
+# Xcode's custom location (Settings › Locations) wins over the default; HERDR_CLEAN_DERIVED_DATA over both.
+dd=$(defaults read com.apple.dt.Xcode IDECustomDerivedDataLocation 2>/dev/null || true)
+dd=${HERDR_CLEAN_DERIVED_DATA:-${dd:-$HOME/Library/Developer/Xcode/DerivedData}}
+dd=${dd%/}
+if $xcode && [[ -d $dd ]]; then
+  for d in "$dd"/*/; do
+    d=${d%/}
+    [[ -f $d/info.plist ]] || continue
+    proj=$(/usr/libexec/PlistBuddy -c 'Print :WorkspacePath' "$d/info.plist" 2>/dev/null || true)
+    [[ -n $proj ]] || continue
+    going=false
+    while IFS= read -r p; do
+      [[ -n $p && ( $proj == "$p" || $proj == "$p"/* ) ]] && going=true && break
+    done <<<"$removed_paths"
+    if $going || [[ ! -e $proj ]]; then
+      add xcode "-" "$d" "$(size_k "$d")" "cache for ${proj/#$HOME/~}" ""
+    fi
+  done
+fi
+if $pnpm && command -v pnpm >/dev/null; then
+  store=$(pnpm store path 2>/dev/null || true)
+  [[ -d $store ]] && add pnpm "-" "$store" "$(size_k "$store")" "store size now; prune drops unreferenced packages" ""
+fi
+
+# ---------- show the plan ----------
+[[ -n $plan ]] || { echo "herdr-clean: nothing to clean"; exit 0; }
+total=0
+printf '%-7s %-8s %s\n' ACTION SIZE WHAT
+while IFS=$'\t' read -r action repo path kb detail ws; do
+  [[ -n $action ]] || continue
+  case $action in remove|rmdir|xcode) total=$((total + kb)) ;; esac
+  sz=$( [[ $kb -gt 0 ]] && human "$kb" || echo -)
+  printf '%-7s %-8s %s\n        %s\n' "$action" "$sz" "${path/#$HOME/~}" "$detail${ws:+ (closes herdr workspace $ws)}"
+done <<<"$plan"
+echo
+echo "herdr-clean: frees about $(human "$total")$($pnpm && echo ' plus whatever pnpm prunes')"
+
+grep -qE '^(remove|prune|rmdir|xcode|pnpm)	' <<<"$plan" || { echo "herdr-clean: nothing to do (only skips and review items)"; exit 0; }
+$dry && exit 0
+if ! $yes; then
+  [[ -t 0 ]] || die "not a terminal; rerun with -y to clean without asking, or -n to only look"
+  read -r -p "Proceed? [y/N] " answer
+  [[ $answer == [yY]* ]] || { echo "herdr-clean: nothing changed"; exit 0; }
+fi
+
+# ---------- do it ----------
+failed=0
+# Plan on fd 3, so `wt remove` hook-approval prompts still read from the terminal.
+while IFS=$'\t' read -r -u 3 action repo path kb detail ws; do
+  case $action in
+    remove)
+      if [[ -n $ws ]] && $have_herdr; then "$herdr" workspace close "$ws" >/dev/null 2>&1 || note "could not close herdr workspace $ws"; fi
+      main=$(git -C "$path" worktree list --porcelain 2>/dev/null | sed -n '1s/^worktree //p')
+      if "$wt" -C "${main:-$path}" remove --foreground "$path"; then :; else note "wt remove failed for $path"; failed=$((failed + 1)); fi ;;
+    rmdir)  # deletes only .DS_Store and empty directories: a file that appeared since planning survives
+      find "$path" -name .DS_Store -type f -delete 2>/dev/null || true
+      find "$path" -depth -type d -empty -delete 2>/dev/null || true
+      [[ ! -e $path ]] || { note "kept $path: it is no longer empty"; failed=$((failed + 1)); } ;;
+    xcode)
+      # Only direct children of DerivedData, nothing else.
+      [[ $path == "$dd"/* && $path != "$dd"/*/* ]] && rm -rf "$path" || { note "refusing to delete $path"; failed=$((failed + 1)); } ;;
+  esac
+done 3<<<"$plan"
+# Stale records (including any left by removals above), once per repo.
+for repo in "${repos[@]}"; do git -C "$repo" worktree prune 2>/dev/null || true; done
+if grep -q '^pnpm	' <<<"$plan"; then
+  pnpm store prune || { note "pnpm store prune failed"; failed=$((failed + 1)); }
+fi
+
+if [[ $failed -gt 0 ]]; then
+  note "done with $failed problem(s) above"
+  exit 1
+fi
+echo "herdr-clean: done"

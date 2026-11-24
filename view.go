@@ -350,9 +350,7 @@ func (m model) menuPreview(w int) []string {
 		add(seg{stBold, "New worktree"})
 		text(stMuted, strings.TrimSpace(m.input.Value()))
 		out = append(out, "")
-		out = append(out, m.willCreate(w)...)
-		out = append(out, "")
-		text(stFaint, "An exact branch name, with no spaces, is used as typed.")
+		text(stFaint, "Claude names the branch and title when you create. An exact branch name, with no spaces, is used as typed.")
 	case rowIssue:
 		is := r.issue
 		meta := []seg{{stFaint, is.ID + "  "}, stateGlyph(is.StateType, is.StateColor), {stMuted, " " + is.State}}
@@ -366,8 +364,6 @@ func (m model) menuPreview(w int) []string {
 			out = append(out, "")
 			add(labelSegs(is.Labels, 6)...)
 		}
-		out = append(out, "")
-		out = append(out, m.willCreate(w)...)
 		d, ok := m.details[is.ID]
 		switch {
 		case !ok:
@@ -392,29 +388,6 @@ func (m model) menuPreview(w int) []string {
 		text(stMuted, "Shows what would go in "+m.repoName(m.repo)+": idle worktrees, stale records, empty leftover folders and orphan Xcode caches, with sizes and the reason for every skip. Nothing is deleted until you say yes.")
 	}
 	return out
-}
-
-// willCreate shows what the highlighted row will become: Claude's title and branch, or progress.
-func (m model) willCreate(w int) []string {
-	in := m.highlighted()
-	if in == "" || m.repo == "" || len(m.agents) == 0 {
-		return nil
-	}
-	key := nameKey(m.repo, in, m.agents[m.defaultAgent(m.repo)])
-	out := []string{paint(w, "", []seg{{stFaint, "WILL CREATE"}}, nil)}
-	j, ok := m.jobs[key]
-	switch {
-	case !ok:
-		return append(out, paint(w, "", []seg{{stFaint, "named by Claude when you pause here"}}, nil))
-	case !j.done:
-		return append(out, paint(w, "", m.naming(key), nil))
-	case j.err != nil:
-		return append(out, paint(w, "", []seg{{stWarn, "naming failed; the form tries again"}}, nil))
-	}
-	return append(out,
-		paint(w, "", []seg{{stMuted, "Title   "}, {stText, j.names.Title}}, nil),
-		paint(w, "", []seg{{stMuted, "Branch  "}, {stText, j.names.Branch}}, whereBadge(j.names.Where)),
-		paint(w, "", []seg{{stAccent, "✦"}, {stFaint, " named by Claude"}}, nil))
 }
 
 // splitTags splits leading bracket tags ("[iOS] [Parity] ") from a title, to draw them dimmer.
@@ -514,7 +487,7 @@ func (m model) viewForm() string {
 	note := []seg{{stFaint, "worktree → herdr workspace → " + m.agentLabel(m.form.agent) + ", prompt typed, not sent"}}
 	switch {
 	case f.queued:
-		note = []seg{{stAccent, m.spin.View() + " starting as soon as the names arrive"}, {stFaint, " · esc cancels"}}
+		note = append(m.naming(f.key), seg{stFaint, ", then creating · esc cancels"})
 	case f.naming:
 		note = []seg{{stFaint, "Claude is still naming; Create waits for it"}}
 	}
@@ -556,17 +529,17 @@ func (m model) fieldValue(fld int, sel bool) []seg {
 		if fld == fBranch {
 			in = m.inBranch
 		}
-		if sel {
-			if in.Value() == "" && f.naming && !f.edited[fld] {
-				return append([]seg{{stPlain, in.View()}}, m.naming(f.key)...)
+		empty := in.Value() == ""
+		switch {
+		case empty && f.naming && !f.edited[fld]:
+			if sel { // keep the cursor visible
+				return append([]seg{{stPlain, "▏"}}, m.naming(f.key)...)
 			}
-			return []seg{{stPlain, in.View()}}
-		}
-		if in.Value() == "" && f.naming && !f.edited[fld] {
 			return m.naming(f.key)
-		}
-		if in.Value() == "" {
-			return []seg{{stDim, "—"}}
+		case sel:
+			return []seg{{stPlain, in.View()}}
+		case empty:
+			return []seg{{stAccent, "✦"}, {stFaint, " " + in.Placeholder}}
 		}
 		return []seg{{stText, in.Value()}}
 	}
@@ -598,9 +571,6 @@ func (m model) promptLines(sel bool, w int) []string {
 	}
 	v := strings.TrimSpace(m.inPrompt.Value())
 	if v == "" {
-		if m.form.naming && !m.form.edited[fPrompt] {
-			return []string{paint(w, "", m.naming(m.form.key), nil)}
-		}
 		return []string{stDim.Render("none")}
 	}
 	ls := wrap(v, w)

@@ -17,20 +17,20 @@ func testModel() model {
 	return m
 }
 
-func TestQueuedCreateLaunchesWhenNamesArrive(t *testing.T) {
+func TestNamingWaitsForCreate(t *testing.T) {
 	m := testModel()
 	tm, _ := m.openForm("fix the login loop", "")
 	m = tm.(model)
-	if !m.form.naming {
-		t.Fatal("form should be naming")
+	if m.form.naming || len(m.jobs) != 0 {
+		t.Fatal("opening the form must not ask Claude")
 	}
-	tm, _ = m.create() // Enter on Create while Claude is still naming
+	tm, cmd := m.create()
 	m = tm.(model)
-	if !m.form.queued || m.action != nil {
-		t.Fatalf("Create while naming should queue, got queued=%v action=%v", m.form.queued, m.action)
+	if !m.form.naming || !m.form.queued || m.action != nil || cmd == nil {
+		t.Fatalf("Create should start naming and wait: naming=%v queued=%v action=%v", m.form.naming, m.form.queued, m.action)
 	}
 
-	// An answer for some other input (a prefetch of another row) changes nothing.
+	// An answer for some other input changes nothing.
 	other := namesMsg{key: nameKey("/repo", "something else", m.agents[0]), names: Names{Branch: "wrong", Title: "Wrong"}}
 	tm, _ = m.gotNames(other)
 	m = tm.(model)
@@ -38,37 +38,34 @@ func TestQueuedCreateLaunchesWhenNamesArrive(t *testing.T) {
 		t.Fatal("a stale answer must not fill the form or launch")
 	}
 
-	tm, cmd := m.gotNames(namesMsg{key: m.form.key, names: Names{Branch: "fix/login-loop", Title: "Fix login loop", Prompt: "fix the login loop"}})
+	tm, cmd = m.gotNames(namesMsg{key: m.form.key, names: Names{Branch: "fix/login-loop", Title: "Fix login loop"}})
 	m = tm.(model)
 	if m.action == nil || cmd == nil {
-		t.Fatal("the answer should launch the queued Create")
+		t.Fatal("the answer should launch the waiting Create")
 	}
 	if _, ok := cmd().(tea.QuitMsg); !ok {
 		t.Fatal("launch should quit the TUI")
 	}
 	want := []string{"--detach", "-B", "fix/login-loop", "--title", "Fix login loop", "--prompt", "fix the login loop"}
-	if len(m.action.Args) != len(want) {
+	if !reflect.DeepEqual(m.action.Args, want) {
 		t.Fatalf("args = %q, want %q", m.action.Args, want)
 	}
-	for i := range want {
-		if m.action.Args[i] != want[i] {
-			t.Fatalf("args = %q, want %q", m.action.Args, want)
-		}
-	}
 }
 
-func TestPrefetchedNamesFillFormAtOnce(t *testing.T) {
+func TestTypedNamesSkipClaude(t *testing.T) {
 	m := testModel()
-	k := nameKey("/repo", "add dark mode", m.agents[0])
-	m.jobs[k] = &nameJob{done: true, names: Names{Branch: "feat/dark-mode", Title: "Add dark mode"}}
-	tm, _ := m.openForm("add dark mode", "")
+	tm, _ := m.openForm("fix the login loop", "")
 	m = tm.(model)
-	if m.form.naming || len(m.jobs) != 1 || m.inBranch.Value() != "feat/dark-mode" {
-		t.Fatalf("a finished prefetch should fill the form with no wait: naming=%v branch=%q", m.form.naming, m.inBranch.Value())
+	m.inTitle.SetValue("Login loop")
+	m.inBranch.SetValue("fix/login-loop")
+	tm, _ = m.create()
+	m = tm.(model)
+	if m.action == nil || len(m.jobs) != 0 {
+		t.Fatal("with title and branch filled in, Create should launch without Claude")
 	}
 }
 
-func TestTypingMarksEditedAndBeatsLateNames(t *testing.T) {
+func TestTypingBeatsLateNames(t *testing.T) {
 	m := testModel()
 	tm, _ := m.openForm("fix the login loop", "")
 	m = tm.(model)
@@ -81,20 +78,15 @@ func TestTypingMarksEditedAndBeatsLateNames(t *testing.T) {
 	if !m.form.edited[fBranch] || m.inBranch.Value() != "fix/mine" {
 		t.Fatalf("typing should edit the branch: edited=%v value=%q", m.form.edited[fBranch], m.inBranch.Value())
 	}
+	tm, _ = m.updateForm(tea.KeyMsg{Type: tea.KeyCtrlS}) // title is empty: Claude names it
+	m = tm.(model)
+	if !m.form.queued {
+		t.Fatal("ctrl+s with an empty title should name, then create")
+	}
 	tm, _ = m.gotNames(namesMsg{key: m.form.key, names: Names{Branch: "fix/claude", Title: "Claude title"}})
 	m = tm.(model)
-	if m.inBranch.Value() != "fix/mine" || m.inTitle.Value() != "Claude title" {
+	if m.action == nil || m.inBranch.Value() != "fix/mine" || m.inTitle.Value() != "Claude title" {
 		t.Fatalf("names must fill only untouched fields: branch=%q title=%q", m.inBranch.Value(), m.inTitle.Value())
-	}
-}
-
-func TestCtrlSQueuesWhileNaming(t *testing.T) {
-	m := testModel()
-	tm, _ := m.openForm("fix the login loop", "")
-	m = tm.(model)
-	tm, _ = m.updateForm(tea.KeyMsg{Type: tea.KeyCtrlS})
-	if m = tm.(model); !m.form.queued {
-		t.Fatal("ctrl+s while naming should queue the create")
 	}
 }
 

@@ -107,16 +107,15 @@ type model struct {
 	bases    map[string][]string // recent branches per project, for the Base choice
 	prefs    prefs
 
-	form        form
-	inTitle     textinput.Model
-	inBranch    textinput.Model
-	inPrompt    textarea.Model
-	jobs        map[string]*nameJob
-	prefetchSeq int // debounce: only the latest highlight starts a naming job
-	pick        pick
-	spin        spinner.Model
-	flash       string
-	missing     []string // required CLIs not on PATH, shown above the list
+	form     form
+	inTitle  textinput.Model
+	inBranch textinput.Model
+	inPrompt textarea.Model
+	jobs     map[string]*nameJob
+	pick     pick
+	spin     spinner.Model
+	flash    string
+	missing  []string // required CLIs not on PATH, shown above the list
 
 	action *Action
 }
@@ -134,7 +133,6 @@ type namesMsg struct {
 	names Names
 	err   error
 }
-type prefetchMsg struct{ seq int }
 
 func newModel(repo string) model {
 	initStyles(loadTheme())
@@ -148,6 +146,8 @@ func newModel(repo string) model {
 	field := func() textinput.Model {
 		t := textinput.New()
 		t.Prompt = ""
+		t.Placeholder = "Claude names it on Create, or type your own"
+		t.PlaceholderStyle = stFaint
 		return t
 	}
 	ta := textarea.New()
@@ -330,9 +330,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.issuesErr = msg.err.Error()
 		}
 		m.refilter()
-		return m, tea.Batch(m.wantDetail(), m.schedulePrefetch())
-	case prefetchMsg:
-		return m, m.prefetch(msg.seq)
+		return m, m.wantDetail()
 	case detailMsg:
 		m.details[msg.id] = msg.detail
 		return m, nil
@@ -361,10 +359,10 @@ func (m model) updateMenu(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, tea.Quit
 	case "up", "ctrl+p", "shift+tab":
 		m.move(-1)
-		return m, tea.Batch(m.wantDetail(), m.schedulePrefetch())
+		return m, m.wantDetail()
 	case "down", "ctrl+n", "tab":
 		m.move(1)
-		return m, tea.Batch(m.wantDetail(), m.schedulePrefetch())
+		return m, m.wantDetail()
 	case "alt+c":
 		return m.chooseClean()
 	case "enter":
@@ -387,7 +385,7 @@ func (m model) updateMenu(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if m.input.Value() != before {
 		m.cursor = 0
 		m.refilter()
-		return m, tea.Batch(cmd, m.wantDetail(), m.schedulePrefetch())
+		return m, tea.Batch(cmd, m.wantDetail())
 	}
 	return m, cmd
 }
@@ -412,20 +410,18 @@ func (m model) issue(id string) (Issue, bool) {
 
 func (m model) openForm(input, issueID string) (tea.Model, tea.Cmd) {
 	m.form = form{input: input, issueID: issueID, project: m.repo, agent: m.defaultAgent(m.repo)}
-	title, prompt := "", input
+	prompt := input
 	if is, ok := m.issue(issueID); ok {
-		title = issueID + " " + is.Title
 		prompt = "Work on Linear " + issueID + ": " + is.Title + "."
 	}
-	m.inTitle.SetValue(title)
+	m.inTitle.SetValue("")
 	m.inBranch.SetValue("")
 	m.inPrompt.SetValue(prompt)
 	if m.form.project == "" {
 		m.form.cursor = fProject
 	}
 	m.screen = scForm
-	cmd := m.startNaming()
-	return m, tea.Batch(cmd, m.focusField())
+	return m, m.focusField()
 }
 
 // focusField gives the keyboard to the text field under the cursor, if any.
@@ -473,25 +469,6 @@ func (m model) highlighted() string {
 	return ""
 }
 
-// schedulePrefetch starts naming the highlighted row once you pause on it: longer while typing,
-// so a half-typed task is not sent to Claude on every key.
-func (m *model) schedulePrefetch() tea.Cmd {
-	m.prefetchSeq++
-	seq, wait := m.prefetchSeq, 350*time.Millisecond
-	if m.cursor < len(m.rows) && m.rows[m.cursor].kind == rowNew {
-		wait = 700 * time.Millisecond
-	}
-	return tea.Tick(wait, func(time.Time) tea.Msg { return prefetchMsg{seq} })
-}
-
-func (m *model) prefetch(seq int) tea.Cmd {
-	in := m.highlighted()
-	if seq != m.prefetchSeq || m.screen != scMenu || m.repo == "" || len(m.agents) == 0 || in == "" {
-		return nil
-	}
-	return m.ensureNames(m.repo, in, m.agents[m.defaultAgent(m.repo)])
-}
-
 // ensureNames starts a naming job unless one for the same key is running or has succeeded.
 func (m *model) ensureNames(dir, input string, agent Agent) tea.Cmd {
 	k := nameKey(dir, input, agent)
@@ -502,6 +479,18 @@ func (m *model) ensureNames(dir, input string, agent Agent) tea.Cmd {
 	return func() tea.Msg {
 		n, err := resolveNames(dir, input, agent)
 		return namesMsg{k, n, err}
+	}
+}
+
+// forgetNames drops names Claude gave for another project, keeping your edits.
+func (m *model) forgetNames() {
+	f := &m.form
+	f.names, f.naming, f.queued, f.key, f.nameErr = Names{}, false, false, "", ""
+	if !f.edited[fTitle] {
+		m.inTitle.SetValue("")
+	}
+	if !f.edited[fBranch] {
+		m.inBranch.SetValue("")
 	}
 }
 
@@ -553,7 +542,7 @@ func (m model) gotNames(msg namesMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-// applyNames fills the fields you have not changed; edits always win.
+// applyNames fills the title and branch you have not changed; edits always win.
 func (m *model) applyNames(n Names) {
 	f := &m.form
 	f.names = n
@@ -565,10 +554,7 @@ func (m *model) applyNames(n Names) {
 		m.inBranch.SetValue(n.Branch)
 		m.inBranch.CursorEnd()
 	}
-	if !f.edited[fPrompt] {
-		m.inPrompt.SetValue(n.Prompt)
-		m.inPrompt.CursorEnd()
-	}
+	// The prompt stays as shown: names arrive only on Create, too late to change what you saw.
 }
 
 func (m model) fieldText(f int) string {
@@ -694,12 +680,11 @@ func (m *model) choose(field, i int) tea.Cmd {
 	case fAgent:
 		f.agent = i
 	case fProject:
-		changed := f.project != opts[i]
-		f.project, f.base = opts[i], ""
-		// Names depend on the repo (its branches, what exists): ask again for a new project.
-		if changed || (f.names.Branch == "" && !f.naming) {
-			return m.startNaming()
+		if f.project != opts[i] {
+			// Names depend on the repo (its branches, what exists): Create asks again.
+			m.forgetNames()
 		}
+		f.project, f.base = opts[i], ""
 	}
 	return nil
 }
@@ -748,9 +733,12 @@ func (m model) create() (tea.Model, tea.Cmd) {
 	case f.project == "":
 		m.flash = "pick a project first"
 		return m, nil
-	case f.naming && (!f.edited[fBranch] || !f.edited[fTitle]):
-		m.form.queued = true // launches from gotNames when the names arrive
-		return m, nil
+	case (title == "" || branch == "") && (f.naming || f.names.Branch == ""):
+		// Claude names only on Create (naming every highlighted row costs too much): ask,
+		// then launch from gotNames when the names arrive.
+		cmd := m.startNaming()
+		m.form.queued = true
+		return m, cmd
 	case !validBranch(branch):
 		m.flash = "branch name is not valid: " + branch
 		return m, nil

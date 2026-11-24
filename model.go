@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/charmbracelet/bubbles/spinner"
+	"github.com/charmbracelet/bubbles/textarea"
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 )
@@ -22,26 +23,32 @@ type rowKind int
 
 const (
 	rowNew rowKind = iota
+	rowGroup
 	rowIssue
 	rowClean
 )
 
 type row struct {
 	kind  rowKind
-	issue Issue
+	issue Issue // rowIssue; for rowGroup, the group's first issue (its state name, type, colour)
+	count int   // rowGroup: issues in the group
 }
+
+func (r row) selectable() bool { return r.kind != rowGroup }
 
 // Form fields, in display order.
 const (
-	fCreate = iota
-	fTitle
+	fTitle = iota
 	fBranch
 	fBase
 	fProject
 	fAgent
 	fPrompt
+	fCreate
 	fieldCount
 )
+
+func isText(f int) bool { return f == fTitle || f == fBranch || f == fPrompt }
 
 // Action is what runs after the TUI exits, with the terminal handed over.
 type Action struct {
@@ -55,14 +62,11 @@ type form struct {
 	naming         bool
 	nameErr        string
 	names          Names
-	title, branch  string
-	prompt         string
 	base           string // "" = worktrunk's default
 	project        string
 	agent          int
 	edited         [fieldCount]bool // fields you changed: a late naming answer leaves them alone
 	cursor         int
-	editing        bool
 	key            string // the naming job this form waits on (repo, input, agent)
 	queued         bool   // Create was pressed while naming: launch as soon as the names arrive
 }
@@ -100,13 +104,15 @@ type model struct {
 
 	agents   []Agent
 	projects []string
+	bases    map[string][]string // recent branches per project, for the Base choice
 	prefs    prefs
 
 	form        form
+	inTitle     textinput.Model
+	inBranch    textinput.Model
+	inPrompt    textarea.Model
 	jobs        map[string]*nameJob
 	prefetchSeq int // debounce: only the latest highlight starts a naming job
-	edit        textinput.Model
-	editOrig    string // the field's value when its edit began
 	pick        pick
 	spin        spinner.Model
 	flash       string
@@ -130,25 +136,37 @@ type namesMsg struct {
 type prefetchMsg struct{ seq int }
 
 func newModel(repo string) model {
+	initStyles(loadTheme())
+
 	in := textinput.New()
-	in.Placeholder = "type a task or a branch, or pick an issue"
+	in.Placeholder = "type a task or branch, or filter issues"
 	in.Prompt = ""
-	in.PlaceholderStyle = stDim
+	in.PlaceholderStyle = stFaint
 	in.Focus()
 
-	ed := textinput.New()
-	ed.Prompt = ""
-
-	sp := spinner.New(spinner.WithSpinner(spinner.MiniDot), spinner.WithStyle(stAccent))
+	field := func() textinput.Model {
+		t := textinput.New()
+		t.Prompt = ""
+		return t
+	}
+	ta := textarea.New()
+	ta.Prompt = ""
+	ta.ShowLineNumbers = false
+	ta.CharLimit = 0
+	ta.SetHeight(3)
+	ta.FocusedStyle.CursorLine = ta.FocusedStyle.CursorLine.UnsetBackground()
 
 	m := model{
 		repo:          repo,
 		input:         in,
-		edit:          ed,
-		spin:          sp,
+		inTitle:       field(),
+		inBranch:      field(),
+		inPrompt:      ta,
+		spin:          spinner.New(spinner.WithSpinner(spinner.MiniDot), spinner.WithStyle(stAccent)),
 		details:       map[string]IssueDetail{},
 		detailWanted:  map[string]bool{},
 		jobs:          map[string]*nameJob{},
+		bases:         map[string][]string{},
 		agents:        listAgents(),
 		prefs:         loadPrefs(),
 		issuesLoading: repo != "",
@@ -176,15 +194,33 @@ func (m model) repoName(p string) string {
 	return filepath.Base(p)
 }
 
-// refilter rebuilds the menu rows from the query: New (when typing), matching issues, Clean.
+// stateRank orders groups the way Linear does: work in progress first.
+func stateRank(t string) int {
+	switch t {
+	case "started":
+		return 0
+	case "unstarted":
+		return 1
+	case "triage":
+		return 2
+	case "backlog":
+		return 3
+	}
+	return 4
+}
+
+// refilter rebuilds the menu rows from the query: New (when typing), issues grouped by state, Clean.
 func (m *model) refilter() {
 	q := strings.TrimSpace(m.input.Value())
 	lq := strings.ToLower(q)
+	words := strings.Fields(lq)
 	m.rows = m.rows[:0]
 	if q != "" {
 		m.rows = append(m.rows, row{kind: rowNew})
 	}
-	words := strings.Fields(lq)
+	// Group matching issues by state: groups in Linear's order, issues in the CLI's order.
+	var order []string
+	groups := map[string][]Issue{}
 	for _, is := range m.issues {
 		hay := strings.ToLower(is.ID + " " + is.Title)
 		ok := true
@@ -194,7 +230,23 @@ func (m *model) refilter() {
 				break
 			}
 		}
-		if ok {
+		if !ok {
+			continue
+		}
+		if _, seen := groups[is.State]; !seen {
+			order = append(order, is.State)
+		}
+		groups[is.State] = append(groups[is.State], is)
+	}
+	for i := 1; i < len(order); i++ { // insertion sort by rank, stable
+		for j := i; j > 0 && stateRank(groups[order[j]][0].StateType) < stateRank(groups[order[j-1]][0].StateType); j-- {
+			order[j], order[j-1] = order[j-1], order[j]
+		}
+	}
+	for _, st := range order {
+		g := groups[st]
+		m.rows = append(m.rows, row{kind: rowGroup, issue: g[0], count: len(g)})
+		for _, is := range g {
 			m.rows = append(m.rows, row{kind: rowIssue, issue: is})
 		}
 	}
@@ -203,6 +255,28 @@ func (m *model) refilter() {
 	}
 	if m.cursor >= len(m.rows) {
 		m.cursor = max(0, len(m.rows)-1)
+	}
+	m.settle(1)
+}
+
+// settle moves the cursor off a group header, in direction d, or the other way at an end.
+func (m *model) settle(d int) {
+	for _, dir := range []int{d, -d} {
+		for c := m.cursor; c >= 0 && c < len(m.rows); c += dir {
+			if m.rows[c].selectable() {
+				m.cursor = c
+				return
+			}
+		}
+	}
+}
+
+func (m *model) move(d int) {
+	for c := m.cursor + d; c >= 0 && c < len(m.rows); c += d {
+		if m.rows[c].selectable() {
+			m.cursor = c
+			return
+		}
 	}
 }
 
@@ -216,7 +290,7 @@ func (m model) matchedIssues() int {
 	return n
 }
 
-// wantDetail starts fetching the highlighted issue's branch and description, once.
+// wantDetail starts fetching the highlighted issue's description, once.
 func (m *model) wantDetail() tea.Cmd {
 	if m.cursor >= len(m.rows) || m.rows[m.cursor].kind != rowIssue {
 		return nil
@@ -230,10 +304,18 @@ func (m *model) wantDetail() tea.Cmd {
 	return func() tea.Msg { return detailMsg{id, loadDetail(repo, id)} }
 }
 
+// layout sizes the form's inputs to the window.
+func (m *model) layout() {
+	w := max(10, min(m.width, formMaxWidth)-formLabelWidth-22) // room for the badge column
+	m.inTitle.Width, m.inBranch.Width = w, w
+	m.inPrompt.SetWidth(w)
+}
+
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
+		m.layout()
 		return m, nil
 	case spinner.TickMsg:
 		var cmd tea.Cmd
@@ -276,23 +358,18 @@ func (m model) updateMenu(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "esc":
 		return m, tea.Quit
 	case "up", "ctrl+p", "shift+tab":
-		if m.cursor > 0 {
-			m.cursor--
-		}
+		m.move(-1)
 		return m, tea.Batch(m.wantDetail(), m.schedulePrefetch())
 	case "down", "ctrl+n", "tab":
-		if m.cursor < len(m.rows)-1 {
-			m.cursor++
-		}
+		m.move(1)
 		return m, tea.Batch(m.wantDetail(), m.schedulePrefetch())
 	case "alt+c":
 		return m.chooseClean()
 	case "enter":
-		if len(m.rows) == 0 {
+		if m.cursor >= len(m.rows) {
 			return m, nil
 		}
-		r := m.rows[m.cursor]
-		switch r.kind {
+		switch r := m.rows[m.cursor]; r.kind {
 		case rowNew:
 			return m.openForm(strings.TrimSpace(m.input.Value()), "")
 		case rowIssue:
@@ -322,24 +399,50 @@ func (m model) chooseClean() (tea.Model, tea.Cmd) {
 	return m, tea.Quit
 }
 
-func (m model) openForm(input, issueID string) (tea.Model, tea.Cmd) {
-	f := form{input: input, issueID: issueID, project: m.repo, agent: m.defaultAgent(m.repo)}
-	if issueID != "" {
-		for _, is := range m.issues {
-			if is.ID == issueID {
-				f.title = issueID + " " + is.Title
-				f.prompt = "Work on Linear " + issueID + ": " + is.Title + "."
-			}
+func (m model) issue(id string) (Issue, bool) {
+	for _, is := range m.issues {
+		if is.ID == id {
+			return is, true
 		}
-	} else {
-		f.prompt = input
 	}
-	if f.project == "" {
-		f.cursor = fProject
+	return Issue{}, false
+}
+
+func (m model) openForm(input, issueID string) (tea.Model, tea.Cmd) {
+	m.form = form{input: input, issueID: issueID, project: m.repo, agent: m.defaultAgent(m.repo)}
+	title, prompt := "", input
+	if is, ok := m.issue(issueID); ok {
+		title = issueID + " " + is.Title
+		prompt = "Work on Linear " + issueID + ": " + is.Title + "."
 	}
-	m.form = f
+	m.inTitle.SetValue(title)
+	m.inBranch.SetValue("")
+	m.inPrompt.SetValue(prompt)
+	if m.form.project == "" {
+		m.form.cursor = fProject
+	}
 	m.screen = scForm
-	return m, m.startNaming()
+	cmd := m.startNaming()
+	return m, tea.Batch(cmd, m.focusField())
+}
+
+// focusField gives the keyboard to the text field under the cursor, if any.
+func (m *model) focusField() tea.Cmd {
+	m.inTitle.Blur()
+	m.inBranch.Blur()
+	m.inPrompt.Blur()
+	switch m.form.cursor {
+	case fTitle:
+		m.inTitle.CursorEnd()
+		return m.inTitle.Focus()
+	case fBranch:
+		m.inBranch.CursorEnd()
+		return m.inBranch.Focus()
+	case fPrompt:
+		m.inPrompt.CursorEnd()
+		return m.inPrompt.Focus()
+	}
+	return nil
 }
 
 // defaultAgent is the agent last used in repo, else the first one found.
@@ -419,9 +522,9 @@ func (m *model) startNaming() tea.Cmd {
 	return cmd
 }
 
-// nameWait is how long the form's naming job has run, for the progress line.
-func (m model) nameWait() time.Duration {
-	if j, ok := m.jobs[m.form.key]; ok && !j.done {
+// nameWait is how long a naming job has run, for the progress text.
+func (m model) nameWait(key string) time.Duration {
+	if j, ok := m.jobs[key]; ok && !j.done {
 		return time.Since(j.start)
 	}
 	return 0
@@ -442,7 +545,7 @@ func (m model) gotNames(msg namesMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 	m.applyNames(msg.names)
-	if f.queued && !f.editing {
+	if f.queued {
 		return m.create()
 	}
 	return m, nil
@@ -452,116 +555,165 @@ func (m model) gotNames(msg namesMsg) (tea.Model, tea.Cmd) {
 func (m *model) applyNames(n Names) {
 	f := &m.form
 	f.names = n
-	fresh := map[int]string{fTitle: n.Title, fBranch: n.Branch, fPrompt: n.Prompt}
-	for field, v := range fresh {
-		if f.edited[field] {
-			continue
-		}
-		// The field being edited: follow the answer only if nothing was typed yet.
-		if f.editing && f.cursor == field && m.edit.Value() != m.editOrig {
-			continue
-		}
-		switch field {
-		case fTitle:
-			f.title = v
-		case fBranch:
-			f.branch = v
-		case fPrompt:
-			f.prompt = v
-		}
-		if f.editing && f.cursor == field {
-			m.edit.SetValue(v)
-			m.edit.CursorEnd()
-			m.editOrig = v
-		}
+	if !f.edited[fTitle] {
+		m.inTitle.SetValue(n.Title)
+		m.inTitle.CursorEnd()
 	}
+	if !f.edited[fBranch] {
+		m.inBranch.SetValue(n.Branch)
+		m.inBranch.CursorEnd()
+	}
+	if !f.edited[fPrompt] {
+		m.inPrompt.SetValue(n.Prompt)
+		m.inPrompt.CursorEnd()
+	}
+}
+
+func (m model) fieldText(f int) string {
+	switch f {
+	case fTitle:
+		return m.inTitle.Value()
+	case fBranch:
+		return m.inBranch.Value()
+	case fPrompt:
+		return m.inPrompt.Value()
+	}
+	return ""
 }
 
 func (m model) updateForm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	f := &m.form
-	if f.editing {
-		switch msg.String() {
-		case "enter":
-			if m.edit.Value() == m.editOrig { // nothing typed: keep the field as it is, still Claude's
-				f.editing = false
-				m.edit.Blur()
-				return m, nil
-			}
-			v := strings.TrimSpace(m.edit.Value())
-			switch f.cursor {
-			case fTitle:
-				f.title = v
-			case fBranch:
-				f.branch = v
-			case fPrompt:
-				f.prompt = v
-			}
-			f.edited[f.cursor] = true
-			f.editing = false
-			m.edit.Blur()
-			return m, nil
-		case "esc":
-			f.editing = false
-			m.edit.Blur()
-			return m, nil
-		}
-		var cmd tea.Cmd
-		m.edit, cmd = m.edit.Update(msg)
-		return m, cmd
-	}
 	switch msg.String() {
+	case "ctrl+s":
+		return m.create()
 	case "esc":
 		if f.queued { // first esc only cancels the pending Create
 			f.queued = false
 			return m, nil
 		}
 		m.screen = scMenu
+		m.inTitle.Blur()
+		m.inBranch.Blur()
+		m.inPrompt.Blur()
 		return m, nil
-	case "up", "ctrl+p", "shift+tab":
+	case "up", "shift+tab":
 		if f.cursor > 0 {
 			f.cursor--
 		}
-	case "down", "ctrl+n", "tab":
+		return m, m.focusField()
+	case "down", "tab":
 		if f.cursor < fieldCount-1 {
 			f.cursor++
 		}
+		return m, m.focusField()
 	case "enter":
 		switch f.cursor {
 		case fCreate:
 			return m.create()
-		case fTitle, fBranch, fPrompt:
-			v := map[int]string{fTitle: f.title, fBranch: f.branch, fPrompt: f.prompt}[f.cursor]
-			m.edit.SetValue(v)
-			m.edit.CursorEnd()
-			m.editOrig = v
-			m.edit.Width = max(10, m.width/2-20)
-			f.editing = true
-			return m, m.edit.Focus()
-		case fBase:
-			opts := append([]string{"default (worktrunk)"}, recentBranches(f.project)...)
-			m.pick = pick{field: fBase, options: opts}
-			m.screen = scPick
-		case fProject:
-			if m.projects == nil {
-				m.projects = listProjects(m.repo)
+		case fBase, fProject, fAgent:
+			m.openPick(f.cursor)
+			return m, nil
+		}
+		f.cursor++ // a text field: on to the next
+		return m, m.focusField()
+	case "left", "right":
+		if c := f.cursor; c == fBase || c == fProject || c == fAgent {
+			d := 1
+			if msg.String() == "left" {
+				d = -1
 			}
-			m.pick = pick{field: fProject, options: m.projects}
-			for i, p := range m.projects {
-				if p == f.project {
-					m.pick.cursor = i
-				}
-			}
-			m.screen = scPick
-		case fAgent:
-			var opts []string
-			for _, a := range m.agents {
-				opts = append(opts, a.Label)
-			}
-			m.pick = pick{field: fAgent, options: opts, cursor: f.agent}
-			m.screen = scPick
+			return m, m.cycle(c, d)
 		}
 	}
-	return m, nil
+	if !isText(f.cursor) {
+		return m, nil
+	}
+	before := m.fieldText(f.cursor)
+	var cmd tea.Cmd
+	switch f.cursor {
+	case fTitle:
+		m.inTitle, cmd = m.inTitle.Update(msg)
+	case fBranch:
+		m.inBranch, cmd = m.inBranch.Update(msg)
+	case fPrompt:
+		m.inPrompt, cmd = m.inPrompt.Update(msg)
+	}
+	if m.fieldText(f.cursor) != before {
+		f.edited[f.cursor] = true
+	}
+	return m, cmd
+}
+
+// choices lists a choice field's options and the index of its current value.
+func (m *model) choices(field int) ([]string, int) {
+	f := &m.form
+	var opts []string
+	cur := 0
+	switch field {
+	case fBase:
+		if _, ok := m.bases[f.project]; !ok {
+			m.bases[f.project] = recentBranches(f.project)
+		}
+		opts = append([]string{""}, m.bases[f.project]...)
+		for i, b := range opts {
+			if b == f.base {
+				cur = i
+			}
+		}
+	case fProject:
+		if m.projects == nil {
+			m.projects = listProjects(m.repo)
+		}
+		opts = m.projects
+		for i, p := range opts {
+			if p == f.project {
+				cur = i
+			}
+		}
+	case fAgent:
+		for _, a := range m.agents {
+			opts = append(opts, a.Label)
+		}
+		cur = f.agent
+	}
+	return opts, cur
+}
+
+// choose sets a choice field to option i; a new project means new names.
+func (m *model) choose(field, i int) tea.Cmd {
+	opts, _ := m.choices(field)
+	if i < 0 || i >= len(opts) {
+		return nil
+	}
+	f := &m.form
+	switch field {
+	case fBase:
+		f.base = opts[i]
+	case fAgent:
+		f.agent = i
+	case fProject:
+		changed := f.project != opts[i]
+		f.project, f.base = opts[i], ""
+		// Names depend on the repo (its branches, what exists): ask again for a new project.
+		if changed || (f.names.Branch == "" && !f.naming) {
+			return m.startNaming()
+		}
+	}
+	return nil
+}
+
+func (m *model) cycle(field, d int) tea.Cmd {
+	opts, cur := m.choices(field)
+	if len(opts) == 0 {
+		return nil
+	}
+	return m.choose(field, (cur+d+len(opts))%len(opts))
+}
+
+func (m *model) openPick(field int) {
+	opts, cur := m.choices(field)
+	m.pick = pick{field: field, options: opts, cursor: cur}
+	m.screen = scPick
 }
 
 func (m model) updatePick(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
@@ -578,36 +730,15 @@ func (m model) updatePick(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			p.cursor++
 		}
 	case "enter":
-		if len(p.options) == 0 {
-			m.screen = scForm
-			return m, nil
-		}
-		f := &m.form
 		m.screen = scForm
-		switch p.field {
-		case fBase:
-			if p.cursor == 0 {
-				f.base = ""
-			} else {
-				f.base = p.options[p.cursor]
-			}
-		case fAgent:
-			f.agent = p.cursor
-		case fProject:
-			changed := f.project != p.options[p.cursor]
-			f.project = p.options[p.cursor]
-			f.base = ""
-			// Names depend on the repo (its branch style, what exists): ask again for a new project.
-			if changed || (f.names.Branch == "" && !f.naming) {
-				return m, m.startNaming()
-			}
-		}
+		return m, m.choose(p.field, p.cursor)
 	}
 	return m, nil
 }
 
 func (m model) create() (tea.Model, tea.Cmd) {
 	f := m.form
+	title, branch := strings.TrimSpace(m.inTitle.Value()), strings.TrimSpace(m.inBranch.Value())
 	switch {
 	case len(m.agents) == 0:
 		m.flash = "no agent CLI found on PATH (claude, codex, ...)"
@@ -618,15 +749,15 @@ func (m model) create() (tea.Model, tea.Cmd) {
 	case f.naming && (!f.edited[fBranch] || !f.edited[fTitle]):
 		m.form.queued = true // launches from gotNames when the names arrive
 		return m, nil
-	case !validBranch(f.branch):
-		m.flash = "branch name is not valid: " + f.branch
+	case !validBranch(branch):
+		m.flash = "branch name is not valid: " + branch
 		return m, nil
-	case strings.TrimSpace(f.title) == "":
+	case title == "":
 		m.flash = "title is empty"
 		return m, nil
 	}
 	agent := m.agents[f.agent]
-	args := []string{"--detach", "-B", f.branch, "--title", f.title, "--prompt", f.prompt}
+	args := []string{"--detach", "-B", branch, "--title", title, "--prompt", strings.TrimSpace(m.inPrompt.Value())}
 	args = append(args, agent.Args...)
 	if f.base != "" {
 		args = append(args, "-b", f.base)

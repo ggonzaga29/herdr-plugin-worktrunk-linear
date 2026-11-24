@@ -18,11 +18,18 @@ import (
 
 // Issue is one Linear issue in the menu.
 type Issue struct {
-	ID     string
-	Title  string
-	State  string
-	Labels []string
+	ID            string
+	Title         string
+	State         string
+	StateType     string // triage, backlog, unstarted, started, completed, canceled
+	StateColor    string // Linear's hex colour for the state
+	Priority      int    // 0 none, 1 urgent, 2 high, 3 medium, 4 low
+	PriorityLabel string
+	Labels        []Label
 }
+
+// Label is a Linear label with its hex colour.
+type Label struct{ Name, Color string }
 
 // IssueDetail is fetched when an issue is highlighted (the list query has no branch or description).
 type IssueDetail struct {
@@ -99,6 +106,50 @@ func clean(s string, keepNewlines bool) string {
 	}, s)
 }
 
+var hexRE = regexp.MustCompile(`^#[0-9A-Fa-f]{6}$`)
+
+// hexColor keeps a colour only if it is a plain #rrggbb (it is drawn as a terminal colour).
+func hexColor(c string) string {
+	if hexRE.MatchString(c) {
+		return c
+	}
+	return ""
+}
+
+// palette is the popup's colours: herdr's [theme.custom] when set, else these defaults.
+type palette struct {
+	text, muted, faint, dim, accent, sel, surface, red, yellow, green string
+}
+
+var themeLineRE = regexp.MustCompile(`^\s*([a-z0-9_]+)\s*=\s*"(#[0-9A-Fa-f]{6})"`)
+
+// loadTheme reads the colour keys of herdr's [theme.custom] table, so the popup matches herdr.
+// ponytail: a line regex, not a TOML parser; only flat `key = "#rrggbb"` lines are read.
+func loadTheme() palette {
+	p := palette{text: "#e5e5e5", muted: "#a3a3a3", faint: "#737373", dim: "#525252", accent: "#60a5fa",
+		sel: "#303030", surface: "#222222", red: "#f87171", yellow: "#facc15", green: "#4ade80"}
+	home, _ := os.UserHomeDir()
+	b, err := os.ReadFile(filepath.Join(home, ".config", "herdr", "config.toml"))
+	if err != nil {
+		return p
+	}
+	slots := map[string]*string{"text": &p.text, "subtext0": &p.muted, "overlay1": &p.faint, "overlay0": &p.dim,
+		"accent": &p.accent, "selection_bg": &p.sel, "surface0": &p.surface, "red": &p.red, "yellow": &p.yellow, "green": &p.green}
+	in := false
+	for _, l := range strings.Split(string(b), "\n") {
+		if t := strings.TrimSpace(l); strings.HasPrefix(t, "[") {
+			in = t == "[theme.custom]"
+			continue
+		}
+		if m := themeLineRE.FindStringSubmatch(l); in && m != nil {
+			if dst, ok := slots[m[1]]; ok {
+				*dst = m[2]
+			}
+		}
+	}
+	return p
+}
+
 func stripANSI(s string) string { return ansiRE.ReplaceAllString(s, "") }
 
 func firstLine(s string) string {
@@ -169,14 +220,19 @@ func loadIssues(repo string) ([]Issue, error) {
 	}
 	var res struct {
 		Nodes []struct {
-			Identifier string `json:"identifier"`
-			Title      string `json:"title"`
-			State      struct {
-				Name string `json:"name"`
+			Identifier    string `json:"identifier"`
+			Title         string `json:"title"`
+			Priority      int    `json:"priority"`
+			PriorityLabel string `json:"priorityLabel"`
+			State         struct {
+				Name  string `json:"name"`
+				Type  string `json:"type"`
+				Color string `json:"color"`
 			} `json:"state"`
 			Labels struct {
 				Nodes []struct {
-					Name string `json:"name"`
+					Name  string `json:"name"`
+					Color string `json:"color"`
 				} `json:"nodes"`
 			} `json:"labels"`
 		} `json:"nodes"`
@@ -186,9 +242,13 @@ func loadIssues(repo string) ([]Issue, error) {
 	}
 	issues := make([]Issue, 0, len(res.Nodes))
 	for _, n := range res.Nodes {
-		is := Issue{ID: clean(n.Identifier, false), Title: clean(n.Title, false), State: clean(n.State.Name, false)}
+		is := Issue{
+			ID: clean(n.Identifier, false), Title: clean(n.Title, false),
+			State: clean(n.State.Name, false), StateType: n.State.Type, StateColor: hexColor(n.State.Color),
+			Priority: n.Priority, PriorityLabel: clean(n.PriorityLabel, false),
+		}
 		for _, l := range n.Labels.Nodes {
-			is.Labels = append(is.Labels, clean(l.Name, false))
+			is.Labels = append(is.Labels, Label{clean(l.Name, false), hexColor(l.Color)})
 		}
 		issues = append(issues, is)
 	}

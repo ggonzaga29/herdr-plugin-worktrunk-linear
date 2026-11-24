@@ -32,6 +32,9 @@ Config (git config, in a repo or with --global; an env var of the same name wins
   herdr-start.ticketBranch   HERDR_START_TICKET_BRANCH   "format" (default) or "linear" (Linear's own
       branch name, e.g. "alex/eng-123-title", as is)
   herdr-start.model          HERDR_START_MODEL           default "sonnet" (the latest Sonnet)
+  herdr-start.namingPrompt   HERDR_START_NAMING_PROMPT   your own naming instructions, in plain words;
+      they are added to Claude's rules and win where the two disagree, e.g.
+      "Start the slug with the area it touches: web, api or ios."
   Example: git config --global herdr-start.branchFormat '{id}-{slug}' 
 
 The branch is switched to if it exists locally or on the remote (fetched if needed), and created
@@ -157,6 +160,7 @@ ticket_branch=${ticket_branch:-format}
 [[ $ticket_branch == format || $ticket_branch == linear ]] || die "herdr-start.ticketBranch must be format or linear, not: $ticket_branch"
 model=${HERDR_START_MODEL:-$(cfg model)}
 model=${model:-sonnet}
+naming_prompt=${HERDR_START_NAMING_PROMPT:-$(cfg namingPrompt)}
 
 # ---------- Claude naming ----------
 # One structured call (Sonnet by default). Prints the structured JSON, or fails (no claude, error, timeout, junk).
@@ -242,6 +246,10 @@ ask_names() {
 type: the kind of change, one of: $branch_types. fix = something broken (bugs, crashes, wrong behaviour); feat = new or changed behaviour; refactor = same behaviour, better code; chore = tooling, dependencies, upkeep; docs, test, perf, ci as usual.
 slug: 2 to 5 lowercase words joined by hyphens, at most 40 characters, naming what changes, most specific words first (e.g. empty-wallet-list-crash). Leave out the type, ticket IDs, people's names, and filler words such as the, update, issue, ticket.
 title: at most 40 characters, sentence case, no trailing period, readable at a glance in a sidebar (e.g. Fix crash on empty wallet list).
+
+"
+  [[ -n $naming_prompt ]] && ask+="Instructions from the user for this repo. Where they disagree with the rules above, follow these:
+$naming_prompt
 
 "
   if [[ $1 == ticket ]]; then

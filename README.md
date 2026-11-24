@@ -110,10 +110,12 @@ Configure with git config, per repo or `--global` (an env var of the same name w
 | `herdr-start.branchTypes` | `feat fix chore refactor docs test perf ci` | the types Claude may choose |
 | `herdr-start.ticketBranch` | `format` | `linear`: use Linear's own branch name for tickets, as is |
 | `herdr-start.model` | `sonnet` | any `claude --model` value, e.g. `haiku` for speed |
+| `herdr-start.namingPrompt` | none | your own naming instructions, in plain words; added to Claude's rules, and they win where the two disagree |
 
 ```sh
 git config --global herdr-start.branchFormat '{id}-{slug}'      # eng-123-empty-wallet-list-crash
 git config herdr-start.branchFormat '{type}/{slug}'             # this repo only; tickets still get their ID
+git config herdr-start.namingPrompt 'Start the slug with the area it touches: web, api or ios.'
 ```
 
 ## Releasing
